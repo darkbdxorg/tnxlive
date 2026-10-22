@@ -39,6 +39,13 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+      - name: Fetch FFmpegKit Android AAR (upstream 7.0 asset is missing; use 6.0 LTS full-gpl)
+        run: |
+          LIBS=$(find ~/.pub-cache/hosted/pub.dev -type d -path "*ffmpeg_kit_flutter_android-*/android/libs" | head -1)
+          echo "Plugin libs dir: $LIBS"
+          curl -sL -o "$LIBS/com.arthenica.ffmpegkit-flutter-7.0.aar" https://github.com/sk3llo/ffmpeg_kit_flutter/releases/download/6.0.2/ffmpeg-kit-full-gpl-6.0.LTS.aar
+          ls -lh "$LIBS"
+
       - name: Generate launcher icons
         run: flutter pub run flutter_launcher_icons || true
 
