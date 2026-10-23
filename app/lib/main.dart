@@ -1,12 +1,15 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:battery_plus/battery_plus.dart';
 import 'package:ffmpeg_kit_flutter_new_gpl/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_gpl/ffmpeg_kit_config.dart';
 import 'package:ffmpeg_kit_flutter_new_gpl/return_code.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -29,7 +32,34 @@ class LiveTaskHandler extends TaskHandler {
 
   @override
   void onRepeatEvent(DateTime timestamp) {
-    final start = _started;
+    _refreshNotification(timestamp);
+  }
+
+  // The service runs in two modes, shared with the main isolate through
+  // SharedPreferences key 'fg_mode': 'live' (streaming now) and 'schedule'
+  // (armed, waiting for the scheduled start time).
+  Future<void> _refreshNotification(DateTime timestamp) async {
+    var mode = 'live';
+    int? liveStartedMs;
+    var startLabel = '';
+    var stopLabel = '';
+    try {
+      final p = await SharedPreferences.getInstance();
+      mode = p.getString('fg_mode') ?? 'live';
+      liveStartedMs = p.getInt('live_started_ms');
+      startLabel = p.getString('sched_start_label') ?? '';
+      stopLabel = p.getString('sched_stop_label') ?? '';
+    } catch (_) {
+      // fall through with defaults (live mode)
+    }
+    if (mode == 'schedule') {
+      FlutterForegroundTask.updateService(
+        notificationTitle: 'TNxLive — Schedule ON',
+        notificationText: 'Live shuru hobe $startLabel • bondho hobe $stopLabel',
+      );
+      return;
+    }
+    final start = liveStartedMs != null ? DateTime.fromMillisecondsSinceEpoch(liveStartedMs) : _started;
     if (start == null) return;
     final elapsed = timestamp.difference(start);
     FlutterForegroundTask.updateService(
@@ -147,6 +177,32 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   final _logScroll = ScrollController();
   late final AnimationController _pulse;
 
+  bool _loading = true; // true while _loadPrefs runs (blocks save-back loops)
+
+  // ---- Profiles (feature 7) ----
+  List<Map<String, dynamic>> _profiles = [];
+  int _activeProfile = 0;
+
+  // ---- Schedule (feature 4) ----
+  bool _schedOn = false;
+  TimeOfDay _schedStart = const TimeOfDay(hour: 22, minute: 0);
+  TimeOfDay _schedStop = const TimeOfDay(hour: 6, minute: 0);
+  Timer? _schedTimer;
+  bool _schedBusy = false;
+  bool _liveBySchedule = false;
+  DateTime? _schedSuppressedFor; // window-start the user manually stopped in
+  DateTime? _schedFailWindow;
+  int _schedFailCount = 0;
+  bool _sessionEndedWithError = false;
+
+  // ---- Battery guard (feature 9) ----
+  final Battery _battery = Battery();
+  final FlutterLocalNotificationsPlugin _notif = FlutterLocalNotificationsPlugin();
+  int _batteryThreshold = 15;
+  Timer? _batteryTimer;
+  bool _batteryFired = false;
+  String? _batteryWarn;
+
   static const _qualityMap = {
     '480p': (w: 854, h: 480, bitrate: '1200k', buf: '2400k'),
     '720p': (w: 1280, h: 720, bitrate: '2500k', buf: '5000k'),
@@ -158,37 +214,111 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     super.initState();
     _pulse = AnimationController(vsync: this, duration: const Duration(milliseconds: 900))..repeat(reverse: true);
     _initForegroundTask();
+    _initNotifications();
     _loadPrefs();
     for (final c in [_ytKey, _fbKey, _customUrl]) {
       c.addListener(_savePrefs);
     }
+    _schedTimer = Timer.periodic(const Duration(seconds: 20), (_) => _scheduleCheck());
   }
 
   @override
   void dispose() {
     _ticker?.cancel();
+    _schedTimer?.cancel();
+    _batteryTimer?.cancel();
     _pulse.dispose();
     _logScroll.dispose();
     super.dispose();
   }
 
-  // ---------- prefs ----------
+  // ---------- prefs + profiles ----------
+  Map<String, dynamic> _profileFromLegacy(SharedPreferences p) {
+    return {
+      'name': 'Profile 1',
+      'ytOn': p.getBool('yt_on') ?? true,
+      'ytKey': p.getString('yt_key') ?? '',
+      'fbOn': p.getBool('fb_on') ?? false,
+      'fbKey': p.getString('fb_key') ?? '',
+      'customOn': p.getBool('custom_on') ?? false,
+      'customUrl': p.getString('custom_url') ?? '',
+      'quality': p.getString('quality') ?? '720p',
+      'mode': p.getString('mode') ?? 'reencode',
+    };
+  }
+
+  void _applyProfileToFields(Map<String, dynamic> prof) {
+    _ytOn = prof['ytOn'] as bool? ?? true;
+    _fbOn = prof['fbOn'] as bool? ?? false;
+    _customOn = prof['customOn'] as bool? ?? false;
+    _ytKey.text = prof['ytKey'] as String? ?? '';
+    _fbKey.text = prof['fbKey'] as String? ?? '';
+    _customUrl.text = prof['customUrl'] as String? ?? '';
+    _quality = prof['quality'] as String? ?? '720p';
+    _mode = prof['mode'] as String? ?? 'reencode';
+    if (!_qualityMap.containsKey(_quality)) _quality = '720p';
+    if (_mode != 'reencode' && _mode != 'copy') _mode = 'reencode';
+  }
+
+  Map<String, dynamic> _snapshotProfile(String name) {
+    return {
+      'name': name,
+      'ytOn': _ytOn,
+      'ytKey': _ytKey.text,
+      'fbOn': _fbOn,
+      'fbKey': _fbKey.text,
+      'customOn': _customOn,
+      'customUrl': _customUrl.text,
+      'quality': _quality,
+      'mode': _mode,
+    };
+  }
+
   Future<void> _loadPrefs() async {
     final p = await SharedPreferences.getInstance();
+
+    // Profiles — migrate v1.0's individual saved keys into "Profile 1".
+    var profiles = <Map<String, dynamic>>[];
+    final raw = p.getString('profiles');
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        profiles = (jsonDecode(raw) as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+      } catch (_) {
+        profiles = [];
+      }
+    }
+    if (profiles.isEmpty) {
+      profiles = [_profileFromLegacy(p)];
+      await p.setString('profiles', jsonEncode(profiles));
+      await p.setInt('active_profile', 0);
+    }
+    var active = p.getInt('active_profile') ?? 0;
+    if (active < 0 || active >= profiles.length) active = 0;
+
+    final schedOn = p.getBool('sched_on') ?? false;
     setState(() {
+      _profiles = profiles;
+      _activeProfile = active;
       _videos = p.getStringList('videos') ?? [];
-      _ytOn = p.getBool('yt_on') ?? true;
-      _fbOn = p.getBool('fb_on') ?? false;
-      _customOn = p.getBool('custom_on') ?? false;
-      _ytKey.text = p.getString('yt_key') ?? '';
-      _fbKey.text = p.getString('fb_key') ?? '';
-      _customUrl.text = p.getString('custom_url') ?? '';
-      _quality = p.getString('quality') ?? '720p';
-      _mode = p.getString('mode') ?? 'reencode';
+      _applyProfileToFields(profiles[active]);
+      _schedOn = schedOn;
+      _schedStart = _todFromMinutes(p.getInt('sched_start_min') ?? 22 * 60);
+      _schedStop = _todFromMinutes(p.getInt('sched_stop_min') ?? 6 * 60);
+      final th = p.getInt('battery_threshold') ?? 15;
+      _batteryThreshold = (th == 10 || th == 20) ? th : 15;
+      _loading = false;
     });
+
+    // Restore an armed schedule after an app relaunch.
+    if (schedOn) {
+      _addLog('Schedule age thekei ON chilo — restore holo');
+      await _restoreScheduleService();
+      _scheduleCheck();
+    }
   }
 
   Future<void> _savePrefs() async {
+    if (_loading) return;
     final p = await SharedPreferences.getInstance();
     await p.setStringList('videos', _videos);
     await p.setBool('yt_on', _ytOn);
@@ -199,6 +329,334 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     await p.setString('custom_url', _customUrl.text);
     await p.setString('quality', _quality);
     await p.setString('mode', _mode);
+    await p.setBool('sched_on', _schedOn);
+    await p.setInt('sched_start_min', _schedStart.hour * 60 + _schedStart.minute);
+    await p.setInt('sched_stop_min', _schedStop.hour * 60 + _schedStop.minute);
+    await p.setInt('battery_threshold', _batteryThreshold);
+    // Any field edit auto-saves back into the active profile.
+    if (_profiles.isNotEmpty) {
+      _profiles[_activeProfile] = _snapshotProfile(_profiles[_activeProfile]['name'] as String? ?? 'Profile ${_activeProfile + 1}');
+      await p.setString('profiles', jsonEncode(_profiles));
+      await p.setInt('active_profile', _activeProfile);
+    }
+  }
+
+  TimeOfDay _todFromMinutes(int m) => TimeOfDay(hour: (m ~/ 60) % 24, minute: m % 60);
+
+  String _fmtTod(TimeOfDay t) {
+    final h = t.hourOfPeriod == 0 ? 12 : t.hourOfPeriod;
+    return '$h:${t.minute.toString().padLeft(2, '0')} ${t.period == DayPeriod.am ? 'AM' : 'PM'}';
+  }
+
+  // ---------- profiles ----------
+  Future<void> _switchProfile(int i) async {
+    if (_live || _starting || i == _activeProfile || i < 0 || i >= _profiles.length) return;
+    setState(() {
+      _activeProfile = i;
+      _applyProfileToFields(_profiles[i]);
+    });
+    await _savePrefs();
+    _addLog('Profile load holo: ${_profiles[i]['name']}');
+  }
+
+  Future<String?> _profileNameDialog(String title, String initial) {
+    final c = TextEditingController(text: initial);
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _card,
+        title: Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+        content: TextField(
+          controller: c,
+          autofocus: true,
+          maxLength: 30,
+          decoration: const InputDecoration(hintText: 'Profile er nam dao'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel', style: TextStyle(color: _txtDim))),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: _red),
+            onPressed: () => Navigator.pop(ctx, c.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _addProfile() async {
+    if (_live) return;
+    if (_profiles.length >= 5) {
+      _snack('Max 5 ta profile rakha jabe');
+      return;
+    }
+    final name = await _profileNameDialog('Notun Profile', 'Profile ${_profiles.length + 1}');
+    if (name == null || name.isEmpty) return;
+    setState(() {
+      _profiles.add(_snapshotProfile(name));
+      _activeProfile = _profiles.length - 1;
+    });
+    await _savePrefs();
+    _addLog('Notun profile add holo: $name (ekhon kar settings copy hoyeche — key/settings bodle nao)');
+  }
+
+  Future<void> _editActiveProfile() async {
+    if (_live || _profiles.isEmpty) return;
+    final current = _profiles[_activeProfile]['name'] as String? ?? 'Profile ${_activeProfile + 1}';
+    final c = TextEditingController(text: current);
+    final action = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _card,
+        title: const Text('Profile Edit', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+        content: TextField(
+          controller: c,
+          autofocus: true,
+          maxLength: 30,
+          decoration: const InputDecoration(hintText: 'Profile er nam'),
+        ),
+        actions: [
+          if (_profiles.length > 1)
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, '__delete__'),
+              child: const Text('Delete', style: TextStyle(color: _red)),
+            ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel', style: TextStyle(color: _txtDim))),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: _red),
+            onPressed: () => Navigator.pop(ctx, c.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (action == null) return;
+    if (action == '__delete__') {
+      final removed = _profiles[_activeProfile]['name'];
+      setState(() {
+        _profiles.removeAt(_activeProfile);
+        _activeProfile = 0;
+        _applyProfileToFields(_profiles[0]);
+      });
+      await _savePrefs();
+      _addLog('Profile delete holo: $removed');
+      return;
+    }
+    if (action.isEmpty) return;
+    setState(() {
+      _profiles[_activeProfile] = _snapshotProfile(action);
+    });
+    await _savePrefs();
+    _addLog('Profile er nam bodle holo: $action');
+  }
+
+  // ---------- notifications (battery guard + schedule alerts) ----------
+  Future<void> _initNotifications() async {
+    try {
+      const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+      await _notif.initialize(const InitializationSettings(android: androidInit));
+      const channel = AndroidNotificationChannel(
+        'tnxlive_alerts',
+        'TNxLive Alerts',
+        description: 'Battery komle ar schedule er alert',
+        importance: Importance.high,
+      );
+      await _notif.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()?.createNotificationChannel(channel);
+    } catch (_) {
+      // alerts are best-effort; the in-app banner/log still work
+    }
+  }
+
+  Future<void> _showAlert(int id, String title, String body) async {
+    try {
+      await _notif.show(
+        id,
+        title,
+        body,
+        const NotificationDetails(
+          android: AndroidNotificationDetails(
+            'tnxlive_alerts',
+            'TNxLive Alerts',
+            channelDescription: 'Battery komle ar schedule er alert',
+            importance: Importance.high,
+            priority: Priority.high,
+            icon: '@mipmap/ic_launcher',
+          ),
+        ),
+      );
+    } catch (_) {}
+  }
+
+  // ---------- battery guard ----------
+  void _startBatteryWatch() {
+    _batteryTimer?.cancel();
+    _batteryFired = false;
+    if (mounted) setState(() => _batteryWarn = null);
+    _batteryTimer = Timer.periodic(const Duration(seconds: 30), (_) => _checkBattery());
+    _checkBattery();
+  }
+
+  Future<void> _checkBattery() async {
+    if (!_live) return;
+    try {
+      final level = await _battery.batteryLevel;
+      final state = await _battery.batteryState;
+      final charging = state == BatteryState.charging || state == BatteryState.full;
+      if (charging) {
+        // Re-arm only after charging back above threshold + 5.
+        if (_batteryFired && level > _batteryThreshold + 5) {
+          _batteryFired = false;
+          if (mounted) setState(() => _batteryWarn = null);
+          _addLog('Battery guard: charge $level% — guard abar active holo');
+        }
+        return;
+      }
+      if (level <= _batteryThreshold && !_batteryFired) {
+        _batteryFired = true;
+        final msg = 'Battery matro $level% — charger lagao! Na hole battery sesh hole live theme jabe';
+        _addLog('⚠ Battery guard: $msg');
+        if (mounted) setState(() => _batteryWarn = msg);
+        await _showAlert(9001, 'TNxLive — Battery kom!', msg);
+      }
+    } catch (_) {}
+  }
+
+  // ---------- schedule ----------
+  bool _inSchedWindow(DateTime now) {
+    final cur = now.hour * 60 + now.minute;
+    final s = _schedStart.hour * 60 + _schedStart.minute;
+    final e = _schedStop.hour * 60 + _schedStop.minute;
+    if (s < e) return cur >= s && cur < e;
+    return cur >= s || cur < e; // overnight window (e.g. 22:00 → 06:00)
+  }
+
+  DateTime _windowStartOccurrence(DateTime now) {
+    var d = DateTime(now.year, now.month, now.day, _schedStart.hour, _schedStart.minute);
+    if (d.isAfter(now)) d = d.subtract(const Duration(days: 1));
+    return d;
+  }
+
+  DateTime _nextOccurrence(TimeOfDay t, DateTime from) {
+    var d = DateTime(from.year, from.month, from.day, t.hour, t.minute);
+    if (!d.isAfter(from)) d = d.add(const Duration(days: 1));
+    return d;
+  }
+
+  String _whenLabel(DateTime d) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final dd = DateTime(d.year, d.month, d.day);
+    final day = dd == today ? 'aaj' : (dd == today.add(const Duration(days: 1)) ? 'kal' : '${d.day}/${d.month}');
+    return '$day ${_fmtTod(TimeOfDay.fromDateTime(d))}';
+  }
+
+  String _schedNextText() {
+    final now = DateTime.now();
+    return 'Next live shuru: ${_whenLabel(_nextOccurrence(_schedStart, now))} • Next bondho: ${_whenLabel(_nextOccurrence(_schedStop, now))}';
+  }
+
+  Future<void> _setFgMode(String mode) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString('fg_mode', mode);
+    await p.setString('sched_start_label', _fmtTod(_schedStart));
+    await p.setString('sched_stop_label', _fmtTod(_schedStop));
+  }
+
+  Future<void> _enterScheduleServiceMode() async {
+    await _setFgMode('schedule');
+    if (!await FlutterForegroundTask.isRunningService) {
+      final r = await FlutterForegroundTask.startService(
+        serviceId: 888,
+        serviceTypes: [ForegroundServiceTypes.mediaPlayback],
+        notificationTitle: 'TNxLive — Schedule ON',
+        notificationText: 'Live shuru hobe ${_fmtTod(_schedStart)} • bondho hobe ${_fmtTod(_schedStop)}',
+        callback: startCallback,
+      );
+      if (r is ServiceRequestFailure) _addLog('Foreground service warning: ${r.error}');
+    } else {
+      FlutterForegroundTask.updateService(
+        notificationTitle: 'TNxLive — Schedule ON',
+        notificationText: 'Live shuru hobe ${_fmtTod(_schedStart)} • bondho hobe ${_fmtTod(_schedStop)}',
+      );
+    }
+  }
+
+  Future<void> _restoreScheduleService() async {
+    await _ensurePermissions();
+    await _enterScheduleServiceMode();
+  }
+
+  Future<void> _armSchedule() async {
+    if (_schedStart == _schedStop) {
+      _snack('Start ar stop time ek hole hobe na — alada time dao');
+      return;
+    }
+    final err = _validate();
+    if (err != null) {
+      _snack(err);
+      return;
+    }
+    await _ensurePermissions();
+    setState(() {
+      _schedOn = true;
+      _schedSuppressedFor = null;
+      _schedFailCount = 0;
+      _schedFailWindow = null;
+    });
+    await _savePrefs();
+    await _enterScheduleServiceMode();
+    _addLog('Schedule ON — live shuru ${_fmtTod(_schedStart)}, bondho ${_fmtTod(_schedStop)} (protidin)');
+    _scheduleCheck(); // starts immediately if already inside the window
+  }
+
+  Future<void> _disarmSchedule() async {
+    setState(() {
+      _schedOn = false;
+      _liveBySchedule = false;
+    });
+    await _savePrefs();
+    _addLog('Schedule OFF kora holo');
+    if (!_live && await FlutterForegroundTask.isRunningService) {
+      await _setFgMode('live');
+      await FlutterForegroundTask.stopService();
+    }
+  }
+
+  Future<void> _scheduleCheck() async {
+    if (!_schedOn || _schedBusy || _starting || !mounted) return;
+    final now = DateTime.now();
+    final inWin = _inSchedWindow(now);
+    if (inWin && !_live) {
+      final ws = _windowStartOccurrence(now);
+      if (_schedSuppressedFor != null && _schedSuppressedFor!.isAtSameMomentAs(ws)) return;
+      if (_schedFailWindow == null || !_schedFailWindow!.isAtSameMomentAs(ws)) {
+        _schedFailWindow = ws;
+        _schedFailCount = 0;
+      }
+      if (_schedFailCount >= 3) {
+        _addLog('Schedule: ei window e stream 3 bar fail koreche — schedule OFF kore dilam');
+        await _showAlert(9002, 'TNxLive — Schedule OFF', 'Stream bar bar fail koray schedule bondho kore dewa hoyeche. Key/net check kore abar ON koro.');
+        await _disarmSchedule();
+        return;
+      }
+      _schedBusy = true;
+      _liveBySchedule = true;
+      _addLog('Schedule time hoyeche — auto live start hocche');
+      await _startLive();
+      if (!_live) {
+        // Validation/start failure — disarm instead of retry-spamming.
+        _liveBySchedule = false;
+        _addLog('Schedule live start holo na — schedule OFF kore dilam, settings check koro');
+        await _disarmSchedule();
+      }
+      _schedBusy = false;
+    } else if (!inWin && _live && _liveBySchedule) {
+      _schedBusy = true;
+      _addLog('Schedule stop time hoyeche — live bondho hocche');
+      _liveBySchedule = false; // scheduled stop — manual-stop suppression must not apply
+      await _stopLive();
+      _schedBusy = false;
+    }
   }
 
   // ---------- foreground task ----------
@@ -226,6 +684,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     if (np != NotificationPermission.granted) {
       await FlutterForegroundTask.requestNotificationPermission();
     }
+    try {
+      await _notif.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()?.requestNotificationsPermission();
+    } catch (_) {}
     final ignoring = await FlutterForegroundTask.isIgnoringBatteryOptimizations;
     if (!ignoring) {
       await FlutterForegroundTask.requestIgnoreBatteryOptimization();
@@ -335,8 +796,12 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
     _addLog('Stream start hocche → ${dests.map((d) => d.name).join(', ')}');
     _addLog('Mode: ${_mode == 'copy' ? 'Copy (no re-encode)' : 'Re-encode $_quality'} • ${_videos.length} video loop');
+    _sessionEndedWithError = false;
 
     // Foreground service (process keep-alive + notification)
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('fg_mode', 'live');
+    await prefs.setInt('live_started_ms', DateTime.now().millisecondsSinceEpoch);
     if (!await FlutterForegroundTask.isRunningService) {
       final r = await FlutterForegroundTask.startService(
         serviceId: 888,
@@ -346,6 +811,12 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         callback: startCallback,
       );
       if (r is ServiceRequestFailure) _addLog('Foreground service warning: ${r.error}');
+    } else {
+      // Service may already be running in schedule mode — switch it to live.
+      FlutterForegroundTask.updateService(
+        notificationTitle: 'TNxLive — LIVE cholche',
+        notificationText: 'Stream cholche • ${dests.map((d) => d.name).join(', ')}',
+      );
     }
     await WakelockPlus.enable();
 
@@ -360,6 +831,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         } else if (ReturnCode.isSuccess(rc)) {
           _addLog('Stream shesh hoyeche');
         } else {
+          _sessionEndedWithError = true;
           final fail = await session.getFailStackTrace();
           _addLog('Stream error (code: $rc) ${fail ?? ''}');
           _snack('Stream theme geche — log dekho, key/net check koro');
@@ -386,6 +858,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       _starting = false;
       _startedAt = DateTime.now();
     });
+    if (_liveBySchedule) {
+      _schedFailCount = 0; // a successful scheduled start clears past failures
+    }
+    _startBatteryWatch();
     _ticker?.cancel();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
@@ -394,21 +870,40 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   Future<void> _cleanupAfterStop() async {
     _ticker?.cancel();
+    _batteryTimer?.cancel();
+    // Count schedule-started streams that died with an error, so the
+    // scheduler can give up after 3 failures in the same window.
+    if (_liveBySchedule && _sessionEndedWithError) {
+      _schedFailCount++;
+    }
+    _liveBySchedule = false;
     await WakelockPlus.disable();
     if (await FlutterForegroundTask.isRunningService) {
-      await FlutterForegroundTask.stopService();
+      if (_schedOn) {
+        // Stay alive in schedule mode — the next scheduled start needs us.
+        await _enterScheduleServiceMode();
+      } else {
+        await FlutterForegroundTask.stopService();
+      }
     }
     if (mounted) {
       setState(() {
         _live = false;
         _starting = false;
         _startedAt = null;
+        _batteryWarn = null;
         _statBitrate = '—'; _statFps = '—'; _statSpeed = '—'; _statSize = '—';
       });
     }
   }
 
   Future<void> _stopLive() async {
+    // If the user manually stops a schedule-started stream, don't let the
+    // scheduler restart it in the same window.
+    if (_liveBySchedule) {
+      _schedSuppressedFor = _windowStartOccurrence(DateTime.now());
+      _addLog('Schedule-er live manually bondho kora holo — ei window e ar auto start hobe na');
+    }
     _addLog('Stream bondho kora hocche…');
     final id = _sessionId;
     if (id != null) {
@@ -535,6 +1030,19 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
             ]),
           ),
 
+          // ---- Battery guard warning banner ----
+          if (_batteryWarn != null)
+            Container(
+              margin: const EdgeInsets.only(bottom: 14),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              decoration: BoxDecoration(color: const Color(0xFF3A0D10), borderRadius: BorderRadius.circular(14), border: Border.all(color: _red.withValues(alpha: 0.55))),
+              child: Row(children: [
+                const Icon(Icons.battery_alert_rounded, color: _red, size: 20),
+                const SizedBox(width: 10),
+                Expanded(child: Text(_batteryWarn!, style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, height: 1.35))),
+              ]),
+            ),
+
           // ---- Playlist ----
           _cardBox(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -563,6 +1071,43 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                         onPressed: _live ? null : () { setState(() => _videos.removeAt(e.key)); _savePrefs(); },
                       ),
                     )),
+            ]),
+          ),
+
+          // ---- Profiles ----
+          _cardBox(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Expanded(child: _sectionTitle('Profiles', Icons.switch_account_rounded)),
+                IconButton(
+                  tooltip: 'Profile edit / delete',
+                  onPressed: _live ? null : _editActiveProfile,
+                  icon: const Icon(Icons.edit_outlined, size: 19, color: _txtDim),
+                  visualDensity: VisualDensity.compact,
+                ),
+                IconButton(
+                  tooltip: 'Notun profile',
+                  onPressed: _live ? null : _addProfile,
+                  icon: const Icon(Icons.add_circle_outline, size: 20, color: _txtDim),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ]),
+              const SizedBox(height: 10),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                for (var i = 0; i < _profiles.length; i++)
+                  ChoiceChip(
+                    label: Text(_profiles[i]['name'] as String? ?? 'Profile ${i + 1}'),
+                    selected: i == _activeProfile,
+                    onSelected: _live ? null : (_) => _switchProfile(i),
+                    selectedColor: _red,
+                    backgroundColor: _card2,
+                    labelStyle: TextStyle(color: i == _activeProfile ? Colors.white : _txtDim),
+                    side: BorderSide.none,
+                  ),
+              ]),
+              const SizedBox(height: 8),
+              const Text('Profile select korle oi channel er key + quality/mode load hobe. Niche field edit korlei oi profile e auto-save hoy. Max 5 ta profile.',
+                  style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
             ]),
           ),
 
@@ -657,6 +1202,75 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
             ]),
           ),
 
+          // ---- Schedule ----
+          _cardBox(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Expanded(child: _sectionTitle('Schedule — Auto Live', Icons.schedule_rounded)),
+                Switch(value: _schedOn, onChanged: _starting ? null : (v) => v ? _armSchedule() : _disarmSchedule()),
+              ]),
+              const SizedBox(height: 6),
+              Row(children: [
+                Expanded(child: _timeTile('Live shuru', _schedStart, () async {
+                  final t = await showTimePicker(context: context, initialTime: _schedStart);
+                  if (t == null) return;
+                  setState(() => _schedStart = t);
+                  await _savePrefs();
+                  if (_schedOn) await _enterScheduleServiceMode();
+                })),
+                const SizedBox(width: 10),
+                Expanded(child: _timeTile('Live bondho', _schedStop, () async {
+                  final t = await showTimePicker(context: context, initialTime: _schedStop);
+                  if (t == null) return;
+                  setState(() => _schedStop = t);
+                  await _savePrefs();
+                  if (_schedOn) await _enterScheduleServiceMode();
+                })),
+              ]),
+              const SizedBox(height: 10),
+              if (_schedOn)
+                Text('🟢 Schedule ON — ${_schedNextText()}',
+                    style: const TextStyle(color: Color(0xFF7BD88A), fontSize: 12, height: 1.4))
+              else
+                const Text('Schedule ON korle protidin ei time e nije nije live start hobe ar stop time e bondho hobe. Window er vitore thakle sathe sathe start hobe.',
+                    style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.4)),
+              const SizedBox(height: 6),
+              const Text('Note: Schedule kaj korte hole app ta recent apps theke mara / force-stop kora jabe na — notification ta rekhe dio. Phone restart hole ekbar app khullei schedule abar active hoye jabe.',
+                  style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.4)),
+            ]),
+          ),
+
+          // ---- Battery Guard ----
+          _cardBox(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _sectionTitle('Battery Guard', Icons.battery_alert_rounded),
+              const SizedBox(height: 10),
+              const Text('Live chalakalin battery kome ei level er niche gele notification + warning asbe — ekbarei asbe, bar bar birokto korbe na. Charge kore level abar upore uthle guard nije nije abar active hobe.',
+                  style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.4)),
+              const SizedBox(height: 10),
+              const Text('Warning level', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              Wrap(spacing: 8, children: [
+                for (final th in [10, 15, 20])
+                  ChoiceChip(
+                    label: Text('$th%'),
+                    selected: _batteryThreshold == th,
+                    onSelected: (_) async {
+                      setState(() {
+                        _batteryThreshold = th;
+                        _batteryFired = false;
+                      });
+                      await _savePrefs();
+                    },
+                    selectedColor: _red,
+                    backgroundColor: _card2,
+                    labelStyle: TextStyle(color: _batteryThreshold == th ? Colors.white : _txtDim),
+                    side: BorderSide.none,
+                  ),
+              ]),
+            ]),
+          ),
+
           // ---- Log ----
           _cardBox(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -712,6 +1326,26 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     );
   }
 
+  Widget _timeTile(String label, TimeOfDay t, VoidCallback onTap) {
+    return InkWell(
+      onTap: _starting ? null : onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(color: _card2, borderRadius: BorderRadius.circular(12)),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(label, style: const TextStyle(color: _txtDim, fontSize: 11)),
+          const SizedBox(height: 3),
+          Row(children: [
+            const Icon(Icons.access_time_rounded, size: 16, color: _red),
+            const SizedBox(width: 6),
+            Text(_fmtTod(t), style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+          ]),
+        ]),
+      ),
+    );
+  }
+
   Widget _stat(String label, String value) {
     return Column(children: [
       Text(value, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, fontFeatures: [FontFeature.tabularFigures()])),
@@ -752,6 +1386,12 @@ class GuidePage extends StatelessWidget {
           _p('• LIVE chalakalin sob somoy charger lagiye rakho — encoding e battery khub druto jay\n• Prothom bar Start chaple battery optimization off korar permission chaibe — allow koro, na hole screen off hole system app bondho kore dite pare\n• App recent apps theke swipe kore fello na\n• Net slow hole 480p use koro; 1080p er jonno strong upload lage\n• WiFi hole sobcheye stable hoy'),
           _h('© Copyright Warning'),
           _p('Sudhu nijer banano / nijer rights ache emon video stream koro. Onner movie, gan, ba TV content loop kore stream dile YouTube/Facebook copyright strike dibe, channel o sash hote pare.'),
+          _h('👤 Profiles'),
+          _p('Alada alada channel er jonno alada profile rakha jay (max 5 ta). Profile e oi channel er YouTube/Facebook/TikTok key + ON/OFF + quality + mode save thake. Upar theke profile select korlei sob load hoye jabe, ar field e kichu bodlale oi profile ei auto-save hobe. Notun profile banate + chap dao, nam bodlate ba delete korte pencil icon chap dao.'),
+          _h('⏰ Schedule — Auto Live'),
+          _p('Protidin nirdishto time e auto live start/stop:\n1) Age playlist, key ar settings thik kore nao\n2) Schedule card e start ar stop time set koro\n3) Toggle ON koro — bas, protidin oi time e live start hobe\n\nWindow er vitore thaka obosthay ON korle sathe sathe live start hobe. Rat 10 ta → sokal 6 tar moto ulta (overnight) time o cholbe.\n\n⚠ Schedule kaj korte hole app ta force-stop kora jabe na ar notification ta rekhe dite hobe — system app mere dile schedule o theme jabe. Phone restart er por ekbar app khullei schedule abar active hoy.'),
+          _h('🔋 Battery Guard'),
+          _p('Live chalakalin battery set kora level (10/15/20%) er niche neme gele ekta notification + screen e warning asbe. Charge lagiye level abar threshold er upore uthle guard nije nije abar active hoy — tai ekbar warning dekhle charger lagiye dilei hobe.'),
           _h('Limit — shotti kotha'),
           _p('Eta phone-only system: phone off, battery sesh ba net chole gele LIVE o theme jabe. Phone na thakleo cholbe emon true 24/7 chaile alada server/VPS lage — seta onno setup.'),
         ],

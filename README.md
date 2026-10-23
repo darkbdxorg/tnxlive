@@ -34,6 +34,35 @@ simultaneously to YouTube, Facebook and any custom RTMP destination
   duration timer, bitrate / FPS / speed / data-sent readouts.
 - **In-app guide** — where to find each platform's stream key (in Banglish).
 
+## New in v1.1
+
+- **Profiles (up to 5)** — save a full setup per channel: YouTube / Facebook /
+  TikTok keys + on/off toggles + quality + mode. Switch profiles from the
+  chips above *Destinations*; editing any field auto-saves back into the
+  active profile. Profiles are stored as JSON in SharedPreferences on the
+  device only, and keys are never written to the Live Log. v1.0's saved keys
+  migrate automatically into "Profile 1".
+- **Schedule — Auto Live** — set a daily start and stop time; the app starts
+  the stream by itself and stops it at the stop time. Overnight windows
+  (e.g. 22:00 → 06:00) work, and arming the schedule while already inside
+  the window starts the stream immediately. Mechanism: while armed, the
+  foreground service stays running in "Schedule ON" mode and an in-app
+  timer checks the clock every ~20 seconds; the notification shows the
+  next start/stop times. If a scheduled stream fails 3 times in the same
+  window, the schedule turns itself off and sends an alert instead of
+  retry-looping. Manually stopping a schedule-started stream suppresses
+  auto-start for the rest of that window. **Caveat: if you force-stop the
+  app (or the system kills it despite the notification), the schedule
+  cannot fire** — Android gives no reliable way to wake a force-stopped app
+  to run FFmpeg; reopening the app re-arms a saved schedule automatically.
+- **Battery guard** — while LIVE, the battery is checked every 30 seconds
+  (`battery_plus`). If it falls to the chosen threshold (10% / 15% / 20%,
+  default 15%) while not charging, you get **one** notification
+  (`flutter_local_notifications`), a Live Log entry and an on-screen banner
+  per crossing — no spam. The guard re-arms after charging back above
+  threshold + 5, or on the next live session. Starting a live session
+  already below the threshold warns immediately.
+
 ## How to get stream keys
 
 - **YouTube**: YouTube Studio → Create → Go Live → Stream → copy the stream
