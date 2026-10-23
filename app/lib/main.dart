@@ -179,6 +179,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   bool _loading = true; // true while _loadPrefs runs (blocks save-back loops)
 
+  // ---- Bottom navigation (v1.2) ----
+  int _tab = 0; // 0 Live · 1 Profiles · 2 Auto · 3 Guide
+
   // ---- Profiles (feature 7) ----
   List<Map<String, dynamic>> _profiles = [];
   int _activeProfile = 0;
@@ -986,17 +989,77 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           const SizedBox(width: 9),
           const Text('TNxLive'),
         ]),
-        actions: [
-          IconButton(
-            tooltip: 'Guide',
-            icon: const Icon(Icons.menu_book_rounded),
-            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const GuidePage())),
+      ),
+      body: IndexedStack(
+        index: _tab,
+        children: [
+          _liveTab(elapsed),
+          _profilesTab(),
+          _autoTab(),
+          const GuidePage(),
+        ],
+      ),
+      bottomNavigationBar: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (_tab == 0)
+            SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 14),
+                child: SizedBox(
+                  height: 58,
+                  child: FilledButton.icon(
+                    onPressed: _starting ? null : (_live ? _stopLive : _startLive),
+                    icon: Icon(_live ? Icons.stop_circle_rounded : Icons.sensors_rounded, size: 24),
+                    label: Text(_starting ? 'START HOCCHE…' : _live ? 'STOP LIVE' : 'START LIVE',
+                        style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w900, letterSpacing: 1.2)),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _live ? const Color(0xFF3A3A42) : _red,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          NavigationBar(
+            selectedIndex: _tab,
+            onDestinationSelected: (i) => setState(() => _tab = i),
+            backgroundColor: _card,
+            indicatorColor: _red.withValues(alpha: 0.28),
+            labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+            destinations: [
+              NavigationDestination(
+                icon: Badge(isLabelVisible: _live, backgroundColor: _red, child: const Icon(Icons.sensors_outlined)),
+                selectedIcon: Badge(isLabelVisible: _live, backgroundColor: _red, child: const Icon(Icons.sensors_rounded)),
+                label: 'Live',
+              ),
+              const NavigationDestination(
+                icon: Icon(Icons.switch_account_outlined),
+                selectedIcon: Icon(Icons.switch_account_rounded),
+                label: 'Profiles',
+              ),
+              const NavigationDestination(
+                icon: Icon(Icons.schedule_outlined),
+                selectedIcon: Icon(Icons.schedule_rounded),
+                label: 'Auto',
+              ),
+              const NavigationDestination(
+                icon: Icon(Icons.menu_book_outlined),
+                selectedIcon: Icon(Icons.menu_book_rounded),
+                label: 'Guide',
+              ),
+            ],
           ),
         ],
       ),
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-        children: [
+    );
+  }
+
+  Widget _liveTab(Duration elapsed) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      children: [
           // ---- Status card ----
           _cardBox(
             child: Column(children: [
@@ -1071,43 +1134,6 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                         onPressed: _live ? null : () { setState(() => _videos.removeAt(e.key)); _savePrefs(); },
                       ),
                     )),
-            ]),
-          ),
-
-          // ---- Profiles ----
-          _cardBox(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                Expanded(child: _sectionTitle('Profiles', Icons.switch_account_rounded)),
-                IconButton(
-                  tooltip: 'Profile edit / delete',
-                  onPressed: _live ? null : _editActiveProfile,
-                  icon: const Icon(Icons.edit_outlined, size: 19, color: _txtDim),
-                  visualDensity: VisualDensity.compact,
-                ),
-                IconButton(
-                  tooltip: 'Notun profile',
-                  onPressed: _live ? null : _addProfile,
-                  icon: const Icon(Icons.add_circle_outline, size: 20, color: _txtDim),
-                  visualDensity: VisualDensity.compact,
-                ),
-              ]),
-              const SizedBox(height: 10),
-              Wrap(spacing: 8, runSpacing: 8, children: [
-                for (var i = 0; i < _profiles.length; i++)
-                  ChoiceChip(
-                    label: Text(_profiles[i]['name'] as String? ?? 'Profile ${i + 1}'),
-                    selected: i == _activeProfile,
-                    onSelected: _live ? null : (_) => _switchProfile(i),
-                    selectedColor: _red,
-                    backgroundColor: _card2,
-                    labelStyle: TextStyle(color: i == _activeProfile ? Colors.white : _txtDim),
-                    side: BorderSide.none,
-                  ),
-              ]),
-              const SizedBox(height: 8),
-              const Text('Profile select korle oi channel er key + quality/mode load hobe. Niche field edit korlei oi profile e auto-save hoy. Max 5 ta profile.',
-                  style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
             ]),
           ),
 
@@ -1202,6 +1228,90 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
             ]),
           ),
 
+          // ---- Log ----
+          _cardBox(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Expanded(child: _sectionTitle('Live Log', Icons.terminal_rounded)),
+                TextButton.icon(
+                  onPressed: () => setState(_logs.clear),
+                  icon: const Icon(Icons.delete_outline, size: 16),
+                  label: const Text('Clear'),
+                  style: TextButton.styleFrom(foregroundColor: _txtDim),
+                ),
+              ]),
+              const SizedBox(height: 8),
+              Container(
+                height: 170,
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(color: const Color(0xFF050507), borderRadius: BorderRadius.circular(12)),
+                child: _logs.isEmpty
+                    ? const Text('Stream start korle ekhane FFmpeg log dekhte paba…', style: TextStyle(color: _txtDim, fontSize: 11.5, fontFamily: 'monospace'))
+                    : ListView.builder(
+                        controller: _logScroll,
+                        itemCount: _logs.length,
+                        itemBuilder: (_, i) => Text(_logs[i], style: const TextStyle(color: Color(0xFFB7F0C0), fontSize: 10.5, fontFamily: 'monospace', height: 1.35)),
+                      ),
+              ),
+            ]),
+          ),
+          const Text('Tip: LIVE chalakalin phone charger e lagiye rakho, ar app ta recent apps theke swipe kore fello na.',
+              textAlign: TextAlign.center, style: TextStyle(color: _txtDim, fontSize: 11.5)),
+          const SizedBox(height: 8),
+      ],
+    );
+  }
+
+  Widget _profilesTab() {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      children: [
+          // ---- Profiles ----
+          _cardBox(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Expanded(child: _sectionTitle('Profiles', Icons.switch_account_rounded)),
+                IconButton(
+                  tooltip: 'Profile edit / delete',
+                  onPressed: _live ? null : _editActiveProfile,
+                  icon: const Icon(Icons.edit_outlined, size: 19, color: _txtDim),
+                  visualDensity: VisualDensity.compact,
+                ),
+                IconButton(
+                  tooltip: 'Notun profile',
+                  onPressed: _live ? null : _addProfile,
+                  icon: const Icon(Icons.add_circle_outline, size: 20, color: _txtDim),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ]),
+              const SizedBox(height: 10),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                for (var i = 0; i < _profiles.length; i++)
+                  ChoiceChip(
+                    label: Text(_profiles[i]['name'] as String? ?? 'Profile ${i + 1}'),
+                    selected: i == _activeProfile,
+                    onSelected: _live ? null : (_) => _switchProfile(i),
+                    selectedColor: _red,
+                    backgroundColor: _card2,
+                    labelStyle: TextStyle(color: i == _activeProfile ? Colors.white : _txtDim),
+                    side: BorderSide.none,
+                  ),
+              ]),
+              const SizedBox(height: 8),
+              const Text('Profile select korle oi channel er key + quality/mode load hobe. Niche field edit korlei oi profile e auto-save hoy. Max 5 ta profile.',
+                  style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
+            ]),
+          ),
+
+      ],
+    );
+  }
+
+  Widget _autoTab() {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      children: [
           // ---- Schedule ----
           _cardBox(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1271,58 +1381,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
             ]),
           ),
 
-          // ---- Log ----
-          _cardBox(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                Expanded(child: _sectionTitle('Live Log', Icons.terminal_rounded)),
-                TextButton.icon(
-                  onPressed: () => setState(_logs.clear),
-                  icon: const Icon(Icons.delete_outline, size: 16),
-                  label: const Text('Clear'),
-                  style: TextButton.styleFrom(foregroundColor: _txtDim),
-                ),
-              ]),
-              const SizedBox(height: 8),
-              Container(
-                height: 170,
-                width: double.infinity,
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(color: const Color(0xFF050507), borderRadius: BorderRadius.circular(12)),
-                child: _logs.isEmpty
-                    ? const Text('Stream start korle ekhane FFmpeg log dekhte paba…', style: TextStyle(color: _txtDim, fontSize: 11.5, fontFamily: 'monospace'))
-                    : ListView.builder(
-                        controller: _logScroll,
-                        itemCount: _logs.length,
-                        itemBuilder: (_, i) => Text(_logs[i], style: const TextStyle(color: Color(0xFFB7F0C0), fontSize: 10.5, fontFamily: 'monospace', height: 1.35)),
-                      ),
-              ),
-            ]),
-          ),
-          const Text('Tip: LIVE chalakalin phone charger e lagiye rakho, ar app ta recent apps theke swipe kore fello na.',
-              textAlign: TextAlign.center, style: TextStyle(color: _txtDim, fontSize: 11.5)),
-          const SizedBox(height: 8),
-        ],
-      ),
-      bottomNavigationBar: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 14),
-          child: SizedBox(
-            height: 58,
-            child: FilledButton.icon(
-              onPressed: _starting ? null : (_live ? _stopLive : _startLive),
-              icon: Icon(_live ? Icons.stop_circle_rounded : Icons.sensors_rounded, size: 24),
-              label: Text(_starting ? 'START HOCCHE…' : _live ? 'STOP LIVE' : 'START LIVE',
-                  style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w900, letterSpacing: 1.2)),
-              style: FilledButton.styleFrom(
-                backgroundColor: _live ? const Color(0xFF3A3A42) : _red,
-                foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-              ),
-            ),
-          ),
-        ),
-      ),
+      ],
     );
   }
 
@@ -1370,9 +1429,9 @@ class GuidePage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Guide — Key kothay paba')),
-      body: ListView(
+    // v1.2: hosted directly as the Guide bottom-nav tab — content unchanged,
+    // just no separate Scaffold/AppBar anymore.
+    return ListView(
         padding: const EdgeInsets.fromLTRB(18, 6, 18, 30),
         children: [
           _p('TNxLive diye tomar phone thekei ek ba ekadhik video loop kore YouTube, Facebook ar Custom RTMP (TikTok soho) te ek sathe live stream korte parba. Stream cholte phone ON, charger e lagano ar internet e thaka lagbe.'),
@@ -1395,7 +1454,6 @@ class GuidePage extends StatelessWidget {
           _h('Limit — shotti kotha'),
           _p('Eta phone-only system: phone off, battery sesh ba net chole gele LIVE o theme jabe. Phone na thakleo cholbe emon true 24/7 chaile alada server/VPS lage — seta onno setup.'),
         ],
-      ),
     );
   }
 }

@@ -63,6 +63,15 @@ simultaneously to YouTube, Facebook and any custom RTMP destination
   threshold + 5, or on the next live session. Starting a live session
   already below the threshold warns immediately.
 
+## New in v1.2
+
+- **Bottom navigation** — the old single long scrolling screen is split into
+  four tabs: **Live** (status/stats, playlist, destinations, stream settings,
+  START/STOP, live log), **Profiles** (profile management), **Auto**
+  (schedule + battery guard) and **Guide**. Tab state is kept alive
+  (`IndexedStack`), so a running stream, the log and all timers survive tab
+  switches; a red dot on the Live tab shows when a stream is running.
+
 ## How to get stream keys
 
 - **YouTube**: YouTube Studio → Create → Go Live → Stream → copy the stream
