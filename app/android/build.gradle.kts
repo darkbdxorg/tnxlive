@@ -2,6 +2,7 @@ allprojects {
     repositories {
         google()
         mavenCentral()
+        maven { url = uri("https://jitpack.io") } // RootEncoder (Screen Live, v1.4)
     }
 }
 

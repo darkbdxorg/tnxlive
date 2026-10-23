@@ -8,6 +8,7 @@ import 'package:ffmpeg_kit_flutter_new_gpl/ffmpeg_kit_config.dart';
 import 'package:ffmpeg_kit_flutter_new_gpl/return_code.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:path_provider/path_provider.dart';
@@ -235,6 +236,24 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   bool _downAlertFired = false; // loud alert already sent for this incident
   bool _pendingOkNotify = false; // next stats tick = reconnect succeeded
 
+  // ---- Screen Live (v1.4) ----
+  // The Live tab's source: 'video' (FFmpeg playlist, existing) or 'screen'
+  // (native MediaProjection -> RTMP via RootEncoder, one destination only).
+  String _source = 'video'; // persisted 'source'
+  String _screenDest = 'youtube'; // youtube | facebook | custom ('screen_dest')
+  String _screenAudio = 'mic'; // mic | mute ('screen_audio')
+  bool _engineScreen = false; // the current live session runs on the screen engine
+  bool _screenProjectionDead = false; // a reconnect found the capture session gone
+  String? _deferredScreenDrop; // native drop event that beat the start result
+  static const _screenCh = MethodChannel('tnxlive/screen');
+  static const _screenEvents = EventChannel('tnxlive/screen/events');
+  StreamSubscription<dynamic>? _screenSub;
+  // Quality -> encoder short edge / video bitrate for screen mode (same
+  // bitrate mapping as video re-encode mode; native scales the long edge
+  // from the real screen size, keeping aspect).
+  static const _screenShortEdge = {'480p': 480, '720p': 720, '1080p': 1080};
+  static const _screenBitrate = {'480p': 1200000, '720p': 2500000, '1080p': 4500000};
+
   // ---- Battery guard (feature 9) ----
   final Battery _battery = Battery();
   final FlutterLocalNotificationsPlugin _notif = FlutterLocalNotificationsPlugin();
@@ -256,6 +275,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     _initForegroundTask();
     FlutterForegroundTask.addTaskDataCallback(_onTaskData);
     _initNotifications();
+    _screenSub = _screenEvents.receiveBroadcastStream().listen(_onScreenEvent, onError: (_) {});
     _loadPrefs();
     for (final c in [_ytKey, _fbKey, _customUrl]) {
       c.addListener(_savePrefs);
@@ -269,6 +289,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     _schedTimer?.cancel();
     _batteryTimer?.cancel();
     _reconnectTimer?.cancel();
+    _screenSub?.cancel();
     FlutterForegroundTask.removeTaskDataCallback(_onTaskData);
     _pulse.dispose();
     _logScroll.dispose();
@@ -350,6 +371,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       final th = p.getInt('battery_threshold') ?? 15;
       _batteryThreshold = (th == 10 || th == 20) ? th : 15;
       _reconnectOn = p.getBool('reconnect_on') ?? true;
+      _source = p.getString('source') ?? 'video';
+      if (_source != 'screen') _source = 'video';
+      _screenDest = p.getString('screen_dest') ?? 'youtube';
+      _screenAudio = p.getString('screen_audio') ?? 'mic';
+      if (_screenAudio != 'mute') _screenAudio = 'mic';
       _loading = false;
     });
 
@@ -378,6 +404,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     await p.setInt('sched_stop_min', _schedStop.hour * 60 + _schedStop.minute);
     await p.setInt('battery_threshold', _batteryThreshold);
     await p.setBool('reconnect_on', _reconnectOn);
+    await p.setString('source', _source);
+    await p.setString('screen_dest', _screenDest);
+    await p.setString('screen_audio', _screenAudio);
     // Any field edit auto-saves back into the active profile.
     if (_profiles.isNotEmpty) {
       _profiles[_activeProfile] = _snapshotProfile(_profiles[_activeProfile]['name'] as String? ?? 'Profile ${_activeProfile + 1}');
@@ -875,8 +904,44 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   int get _destCount => _activeDestinations().length;
 
+  // ---- Screen Live destinations (v1.4) ----
+  // Screen Live publishes ONE native RTMP stream, so the screen panel picks
+  // a single destination out of the active profile's ENABLED ones.
+  List<({String id, String name, String url})> _screenDestinations() {
+    final list = <({String id, String name, String url})>[];
+    if (_ytOn && _ytKey.text.trim().isNotEmpty) {
+      list.add((id: 'youtube', name: 'YouTube', url: '$ytServer${_ytKey.text.trim()}'));
+    }
+    if (_fbOn && _fbKey.text.trim().isNotEmpty) {
+      list.add((id: 'facebook', name: 'Facebook', url: '$fbServer${_fbKey.text.trim()}'));
+    }
+    if (_customOn && _customUrl.text.trim().isNotEmpty) {
+      list.add((id: 'custom', name: 'TikTok / Custom', url: _customUrl.text.trim()));
+    }
+    return list;
+  }
+
+  /// The screen destination in effect: the saved pick while it is still
+  /// enabled, otherwise the first enabled destination.
+  ({String id, String name, String url})? _resolvedScreenDest() {
+    final list = _screenDestinations();
+    if (list.isEmpty) return null;
+    for (final d in list) {
+      if (d.id == _screenDest) return d;
+    }
+    return list.first;
+  }
+
   // ---------- streaming ----------
   String? _validate() {
+    if (_source == 'screen') {
+      if (!_ytOn && !_fbOn && !_customOn) return 'Ontoto 1 ta destination ON koro (YouTube / Facebook / Custom)';
+      if (_ytOn && _ytKey.text.trim().isEmpty) return 'YouTube ON ache kintu Stream Key dewa hoy nai';
+      if (_fbOn && _fbKey.text.trim().isEmpty) return 'Facebook ON ache kintu Stream Key dewa hoy nai';
+      if (_customOn && _customUrl.text.trim().isEmpty) return 'Custom/TikTok ON ache kintu full RTMP URL dewa hoy nai';
+      if (_screenDestinations().isEmpty) return 'Screen Live er jonno ontoto 1 ta destination e key/URL thakte hobe';
+      return null;
+    }
     if (_videos.isEmpty) return 'Age playlist e ontoto 1 ta video add koro';
     if (!_ytOn && !_fbOn && !_customOn) return 'Ontoto 1 ta destination ON koro (YouTube / Facebook / Custom)';
     if (_ytOn && _ytKey.text.trim().isEmpty) return 'YouTube ON ache kintu Stream Key dewa hoy nai';
@@ -897,8 +962,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   }
 
   /// Entry point for going live (START button + schedule). Sets the live
-  /// intent; the actual FFmpeg launch lives in [_launchStream] so
-  /// auto-reconnect can re-run it after a drop.
+  /// intent; the actual launch lives in [_launchStream] (video engine) or
+  /// [_launchScreenStream] (screen engine) so auto-reconnect can re-run it
+  /// after a drop.
   Future<void> _startLive() async {
     final err = _validate();
     if (err != null) {
@@ -908,7 +974,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     _liveIntent = true;
     _reconnectAttempt = 0;
     _downAlertFired = false;
-    final ok = await _launchStream(isReconnect: false);
+    final ok = _source == 'screen'
+        ? await _launchScreenStream(isReconnect: false)
+        : await _launchStream(isReconnect: false);
     if (!ok) {
       _liveIntent = false;
       await _cleanupAfterStop();
@@ -1038,12 +1106,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           if (gen != _sessionGen || !mounted) return;
           if (_pendingOkNotify) {
             // First real data of a reconnected session: incident over.
-            _pendingOkNotify = false;
-            _reconnectAttempt = 0;
-            _downAlertFired = false;
-            if (_liveBySchedule) _schedFailCount = 0;
-            _addLog('✔ Reconnect hoyeche — live abar cholche');
-            _showInfoNotif(9004, 'TNxLive — Live abar chalu hoiche', 'Stream nije nije abar connect hoye geche — live cholche.');
+            _markReconnected();
           }
           setState(() {
             final br = stats.getBitrate();
@@ -1078,6 +1141,217 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       if (mounted) setState(() {});
     });
     return true;
+  }
+
+  // ---- Screen Live engine (v1.4) ----
+  /// Launches one native screen-stream attempt through the `tnxlive/screen`
+  /// bridge. A fresh launch makes the native side show Android's
+  /// MediaProjection consent dialog (system rule: every session needs a
+  /// grant — the app can only launch the dialog, never skip it). A
+  /// reconnect launch reuses the still-alive capture session, so no dialog
+  /// appears — unless the capture was stopped from the system UI, in which
+  /// case the native side answers 'projectionDead' and the caller ends the
+  /// session instead of retry-looping.
+  Future<bool> _launchScreenStream({required bool isReconnect}) async {
+    _stopIntent = _StopIntent.none;
+    _engineScreen = true;
+    if (!isReconnect) _screenProjectionDead = false;
+    setState(() => _starting = true);
+    if (!isReconnect) {
+      await _ensurePermissions();
+      await _savePrefs();
+    }
+
+    final dest = _resolvedScreenDest();
+    if (dest == null) {
+      if (mounted) setState(() => _starting = false);
+      return false;
+    }
+
+    if (!isReconnect && _screenAudio == 'mic') {
+      var micOk = false;
+      try {
+        micOk = await _screenCh.invokeMethod<bool>('requestMicPermission') ?? false;
+      } catch (_) {}
+      if (!micOk) {
+        _addLog('Mic permission pawa jay nai — Screen Live (Mic) start holo na');
+        _snack('Mic permission lagbe — na hole Screen panel theke Mute select koro');
+        if (mounted) setState(() => _starting = false);
+        return false;
+      }
+    }
+
+    if (isReconnect) {
+      _addLog('Screen stream abar start hocche → ${dest.name}');
+    } else {
+      _addLog('Screen Live start hocche → ${dest.name} (screen mode e 1 ta destination ei jay)');
+      _addLog('Audio: ${_screenAudio == 'mic' ? 'Mic' : 'Mute'} • Quality: $_quality (screen er size onujayi scale hobe)');
+    }
+
+    // Foreground service (process keep-alive + notification Stop button) —
+    // same handling as video mode; live_started_ms keeps the original
+    // session start across reconnects so durations match.
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('fg_mode', 'live');
+    if (!isReconnect) {
+      await prefs.setInt('live_started_ms', DateTime.now().millisecondsSinceEpoch);
+    }
+    if (!await FlutterForegroundTask.isRunningService) {
+      final r = await FlutterForegroundTask.startService(
+        serviceId: 888,
+        serviceTypes: [ForegroundServiceTypes.mediaPlayback],
+        notificationTitle: 'TNxLive — SCREEN LIVE cholche',
+        notificationText: 'Screen stream cholche • ${dest.name}',
+        notificationButtons: const [NotificationButton(id: _kBtnStopLive, text: 'Stop')],
+        callback: startCallback,
+      );
+      if (r is ServiceRequestFailure) _addLog('Foreground service warning: ${r.error}');
+    } else {
+      FlutterForegroundTask.updateService(
+        notificationTitle: 'TNxLive — SCREEN LIVE cholche',
+        notificationText: 'Screen stream cholche • ${dest.name}',
+        notificationButtons: const [NotificationButton(id: _kBtnStopLive, text: 'Stop')],
+      );
+    }
+    await WakelockPlus.enable();
+
+    if (!_liveIntent) {
+      // A stop landed while we were preparing (e.g. during reconnect prep).
+      if (mounted) setState(() => _starting = false);
+      return false;
+    }
+
+    final cfg = <String, dynamic>{
+      'url': dest.url,
+      'audio': _screenAudio,
+      'shortEdge': _screenShortEdge[_quality] ?? 720,
+      'videoBitrate': _screenBitrate[_quality] ?? 2500000,
+    };
+    String res;
+    try {
+      res = await _screenCh
+              .invokeMethod<String>(isReconnect ? 'restartScreen' : 'startScreen', cfg)
+              .timeout(const Duration(seconds: 180), onTimeout: () => 'error:permission popup er response pawa jay nai (timeout)') ??
+          'error:null';
+    } catch (e) {
+      _addLog('Screen stream start korte somossa holo: $e');
+      if (mounted) setState(() => _starting = false);
+      return false;
+    }
+    if (res == 'denied') {
+      _addLog('Screen capture permission deya hoy nai — live start holo na');
+      _snack('Permission chara Screen Live hobe na — START chaple popup e Allow koro');
+      if (mounted) setState(() => _starting = false);
+      return false;
+    }
+    if (res == 'projectionDead') {
+      _screenProjectionDead = true;
+      _addLog('Screen capture session sesh hoye geche — reconnect somvob na');
+      if (mounted) setState(() => _starting = false);
+      return false;
+    }
+    if (res != 'started') {
+      _addLog('Screen stream start holo na: $res');
+      if (mounted) setState(() => _starting = false);
+      return false;
+    }
+
+    _sessionActive = true;
+    if (isReconnect) _pendingOkNotify = true;
+    setState(() {
+      _live = true;
+      _starting = false;
+      _startedAt ??= DateTime.now();
+    });
+    if (_liveBySchedule && !isReconnect) {
+      _schedFailCount = 0; // a successful scheduled start clears past failures
+    }
+    _startBatteryWatch(resetFired: !isReconnect);
+    _ticker?.cancel();
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+    // A fast failure (bad key, no route) can deliver its native drop event
+    // before the start result above — it was deferred; process it now that
+    // the session state exists.
+    final deferred = _deferredScreenDrop;
+    _deferredScreenDrop = null;
+    if (deferred != null && _liveIntent) {
+      _sessionActive = false;
+      _addLog('Screen stream error: $deferred');
+      _handleUnexpectedDrop();
+    }
+    return true;
+  }
+
+  /// Native screen-engine events (RootEncoder ConnectChecker, forwarded by
+  /// ScreenStreamService). Drop events feed the exact same alert + backoff
+  /// path as an FFmpeg drop; _sessionActive dedupes the failed/disconnect
+  /// pair one incident can produce.
+  void _onScreenEvent(dynamic raw) {
+    if (raw is! Map || !mounted) return;
+    final type = raw['type'] as String? ?? '';
+    if (!_engineScreen) {
+      // Safety net: a native screen stream we no longer track (e.g. a late
+      // consent grant after a timed-out start) — stop it right away.
+      if (type == 'connectionSuccess' && !_liveIntent) {
+        _screenCh.invokeMethod('stopScreen').catchError((_) => null);
+      }
+      return;
+    }
+    switch (type) {
+      case 'connectionStarted':
+        _addLog('Screen stream connect hocche…');
+      case 'connectionSuccess':
+        _addLog('✔ Screen stream connected');
+        if (_pendingOkNotify) _markReconnected();
+      case 'bitrate':
+        if (!_live || _reconnecting) return;
+        final bps = (raw['bitrate'] as num?)?.toInt() ?? 0;
+        final bytes = (raw['bytes'] as num?)?.toInt() ?? 0;
+        setState(() {
+          _statBitrate = bps <= 0 ? '—' : (bps >= 1000000 ? '${(bps / 1000000).toStringAsFixed(2)} Mbps' : '${(bps / 1000).toStringAsFixed(0)} kbps');
+          _statSize = bytes <= 0 ? '—' : '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+          _statFps = '—'; // the library exposes no fps for screen capture
+          _statSpeed = '—'; // realtime capture has no speed multiplier
+        });
+      case 'connectionFailed':
+      case 'authError':
+        if (_stopIntent != _StopIntent.none || !_liveIntent || !_sessionActive) {
+          // A very fast failure can beat the start call's own result — park
+          // it; _launchScreenStream processes it right after starting.
+          if (_starting && _liveIntent && _stopIntent == _StopIntent.none) {
+            _deferredScreenDrop = raw['reason'] as String? ?? type;
+          }
+          return;
+        }
+        _sessionActive = false;
+        _addLog('Screen stream error: ${raw['reason'] as String? ?? type}');
+        _handleUnexpectedDrop();
+      case 'disconnect':
+        if (_stopIntent != _StopIntent.none || !_liveIntent || !_sessionActive) return;
+        _sessionActive = false;
+        _addLog('Screen stream disconnect hoye geche');
+        _handleUnexpectedDrop();
+      case 'projectionStopped':
+        if (_stopIntent != _StopIntent.none || !_liveIntent) return;
+        _screenProjectionDead = true;
+        _sessionActive = false;
+        _addLog('Screen capture system theke bondho kore dewa hoyeche');
+        _handleUnexpectedDrop();
+    }
+  }
+
+  /// A reconnected session (either engine) is producing data/connecting
+  /// again: the drop incident is over — reset the counters and send the
+  /// quiet "live abar chalu" follow-up (v1.3 feature 8).
+  void _markReconnected() {
+    _pendingOkNotify = false;
+    _reconnectAttempt = 0;
+    _downAlertFired = false;
+    if (_liveBySchedule) _schedFailCount = 0;
+    _addLog('✔ Reconnect hoyeche — live abar cholche');
+    _showInfoNotif(9004, 'TNxLive — Live abar chalu hoiche', 'Stream nije nije abar connect hoye geche — live cholche.');
   }
 
   // ---- v1.3 features 1 + 8: unexpected drop → alert → reconnect/give up ----
@@ -1159,8 +1433,19 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     if (!_liveIntent || !mounted) return;
     setState(() => _reconnecting = false);
     _addLog('Reconnect try kora hocche (attempt $_reconnectAttempt)…');
-    final ok = await _launchStream(isReconnect: true);
+    final ok = _engineScreen
+        ? await _launchScreenStream(isReconnect: true)
+        : await _launchStream(isReconnect: true);
     if (!ok) {
+      if (_engineScreen && _screenProjectionDead) {
+        // The capture session is gone: retrying can never succeed and a new
+        // consent popup needs a deliberate START press. End the session here
+        // (the loud drop alert already fired for this incident).
+        _addLog('Screen capture permission sesh — abar Screen Live korte START LIVE chap diye notun kore permission dao');
+        _liveIntent = false;
+        await _cleanupAfterStop();
+        return;
+      }
       // Couldn't even launch — counts as another failed attempt and loops
       // back through the same backoff + schedule accounting (no extra loud
       // alert: _downAlertFired is already true for this incident).
@@ -1174,14 +1459,26 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   /// backoff gap. Schedule failure counting no longer happens here; it moved
   /// to _handleUnexpectedDrop (v1.3) so failed reconnect attempts count too.
   Future<void> _cleanupAfterStop() async {
+    final wasScreen = _engineScreen;
     _reconnectTimer?.cancel();
     _ticker?.cancel();
     _batteryTimer?.cancel();
     _sessionActive = false;
+    _engineScreen = false;
+    _screenProjectionDead = false;
     _liveIntent = false;
     _reconnecting = false;
     _pendingOkNotify = false;
     _liveBySchedule = false;
+    if (wasScreen) {
+      // End the native capture session too (projection + service), so the
+      // system screen-capture indicator doesn't linger after we go offline.
+      // NOT done during a reconnect gap — this only runs when the session
+      // is truly over. Harmless if the native side is already stopped.
+      try {
+        await _screenCh.invokeMethod('stopScreen');
+      } catch (_) {}
+    }
     await WakelockPlus.disable();
     if (await FlutterForegroundTask.isRunningService) {
       if (_schedOn) {
@@ -1219,7 +1516,16 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       _addLog('Schedule-er live manually bondho kora holo — ei window e ar auto start hobe na');
     }
     _addLog('Stream bondho kora hocche…');
-    if (_sessionActive) {
+    if (_engineScreen) {
+      // Screen engine: deliberate stop goes through the same entry point —
+      // intent is already cleared above, so the native disconnect events
+      // that follow are ignored (no reconnect, no alert).
+      try {
+        await _screenCh.invokeMethod('stopScreen');
+      } catch (_) {}
+      _sessionActive = false;
+      await _cleanupAfterStop();
+    } else if (_sessionActive) {
       final id = _sessionId;
       if (id != null) {
         await FFmpegKit.cancel(id);
@@ -1401,7 +1707,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                   _reconnecting
                       ? 'Reconnecting in ${_reconnectInSec}s (attempt $_reconnectAttempt)'
                       : _live
-                          ? '$_destCount destination e stream jacche'
+                          ? _liveStatusLine
                           : 'Start korte niche sob set kore LIVE chap dao',
                   style: const TextStyle(color: _txtDim, fontSize: 12.5)),
               const SizedBox(height: 14),
@@ -1427,7 +1733,43 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               ]),
             ),
 
+          // ---- Source (v1.4) ----
+          _cardBox(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _sectionTitle('Source', Icons.input_rounded),
+              const SizedBox(height: 12),
+              Wrap(spacing: 8, children: [
+                ChoiceChip(
+                  label: const Text('Video (Playlist)'),
+                  selected: _source == 'video',
+                  onSelected: _live ? null : (_) { setState(() => _source = 'video'); _savePrefs(); },
+                  selectedColor: _red,
+                  backgroundColor: _card2,
+                  labelStyle: TextStyle(color: _source == 'video' ? Colors.white : _txtDim),
+                  side: BorderSide.none,
+                ),
+                ChoiceChip(
+                  label: const Text('Screen Live'),
+                  selected: _source == 'screen',
+                  onSelected: _live ? null : (_) { setState(() => _source = 'screen'); _savePrefs(); },
+                  selectedColor: _red,
+                  backgroundColor: _card2,
+                  labelStyle: TextStyle(color: _source == 'screen' ? Colors.white : _txtDim),
+                  side: BorderSide.none,
+                ),
+              ]),
+              const SizedBox(height: 6),
+              Text(
+                _source == 'video'
+                    ? 'Playlist er video loop kore stream hobe — sob ON destination e ek sathe jay.'
+                    : 'Phone er screen tai live hobe (game, tutorial, app demo). Screen Live ek bare 1 ta destination ei jay — niche theke beche nao.',
+                style: const TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35),
+              ),
+            ]),
+          ),
+
           // ---- Playlist ----
+          if (_source == 'video')
           _cardBox(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
@@ -1498,6 +1840,76 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
             ]),
           ),
 
+          // ---- Screen Live panel (v1.4) ----
+          if (_source == 'screen')
+          _cardBox(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _sectionTitle('Screen Live', Icons.screen_share_rounded),
+              const SizedBox(height: 12),
+              const Text('Destination (1 ta select koro)', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              if (_screenDestinations().isEmpty)
+                const Text('Kono destination ON + key soho nai — uporer Destinations theke ontoto 1 ta ON kore key dao, tarpor ekhane select kora jabe.',
+                    style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35))
+              else
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  decoration: BoxDecoration(color: _card2, borderRadius: BorderRadius.circular(12)),
+                  child: DropdownButton<String>(
+                    value: _resolvedScreenDest()?.id,
+                    isExpanded: true,
+                    underline: const SizedBox.shrink(),
+                    dropdownColor: _card2,
+                    icon: const Icon(Icons.arrow_drop_down, color: _txtDim),
+                    style: const TextStyle(color: Colors.white, fontSize: 13.5),
+                    items: [
+                      for (final d in _screenDestinations())
+                        DropdownMenuItem(value: d.id, child: Text(d.name)),
+                    ],
+                    onChanged: _live
+                        ? null
+                        : (v) {
+                            if (v == null) return;
+                            setState(() => _screenDest = v);
+                            _savePrefs();
+                          },
+                  ),
+                ),
+              const SizedBox(height: 6),
+              const Text('Screen Live ek bare 1 ta destination ei jay — phone er screen capture encoder ekta RTMP stream ei pathay. Video mode e kintu sob destination ek sathe jay, ager motoi.',
+                  style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
+              const SizedBox(height: 14),
+              const Text('Screen er Audio', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              Wrap(spacing: 8, children: [
+                ChoiceChip(
+                  label: const Text('Mic'),
+                  selected: _screenAudio == 'mic',
+                  onSelected: _live ? null : (_) { setState(() => _screenAudio = 'mic'); _savePrefs(); },
+                  selectedColor: _red,
+                  backgroundColor: _card2,
+                  labelStyle: TextStyle(color: _screenAudio == 'mic' ? Colors.white : _txtDim),
+                  side: BorderSide.none,
+                ),
+                ChoiceChip(
+                  label: const Text('Mute'),
+                  selected: _screenAudio == 'mute',
+                  onSelected: _live ? null : (_) { setState(() => _screenAudio = 'mute'); _savePrefs(); },
+                  selectedColor: _red,
+                  backgroundColor: _card2,
+                  labelStyle: TextStyle(color: _screenAudio == 'mute' ? Colors.white : _txtDim),
+                  side: BorderSide.none,
+                ),
+              ]),
+              const SizedBox(height: 6),
+              const Text('Mic select korle prothom bar mic permission chaibe. Mute e kono audio jabe na. Phone er vitore r audio (onno app/game er sound) direct capture kora jay na — eta Android er limit; Mic select korle speaker er awaz mic diye kichuta jete pare.',
+                  style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
+              const SizedBox(height: 10),
+              const Text('START LIVE chaple prottek session e Android ekta "Start capturing?" permission popup dekhabe — Allow na dile screen live start hobe na. Eta system er niyom, bypass kora jay na. Quality niche Stream Settings thekei ney — screen er asol size onujayi scale hoy.',
+                  style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
+            ]),
+          ),
+
           // ---- Settings ----
           _cardBox(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1522,6 +1934,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 _quality == '480p' ? '~1200 kbps — slow net er jonno bhalo' : _quality == '720p' ? '~2500 kbps — recommended, balance bhalo' : '~4500 kbps — fast net lage, phone gorom hote pare',
                 style: const TextStyle(color: _txtDim, fontSize: 11.5),
               ),
+              if (_source == 'video') ...[
               const SizedBox(height: 14),
               const Text('Mode', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
               const SizedBox(height: 8),
@@ -1546,6 +1959,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               const SizedBox(height: 6),
               const Text('Copy mode e re-encode hoy na bole CPU/battery kom lage, kintu video age thekei H.264 + AAC format e thakte hobe, na hole stream cholbe na.',
                   style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
+              ],
               const SizedBox(height: 16),
               Row(children: [
                 const Expanded(
@@ -1566,8 +1980,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 ),
               ]),
               const SizedBox(height: 6),
-              const Text('Note: reconnect hole playlist prothom theke abar start hoy (notun FFmpeg session). Live duration prothom start thekei count hoy, kintu Sent/Bitrate prottek attempt e notun kore count hoy.',
-                  style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
+              Text(
+                  _source == 'screen'
+                      ? 'Note: screen stream katle capture session thakle popup charai abar connect hoy; kintu notification/system theke capture bondho kore dile abar START LIVE chap diye notun kore permission dite hobe.'
+                      : 'Note: reconnect hole playlist prothom theke abar start hoy (notun FFmpeg session). Live duration prothom start thekei count hoy, kintu Sent/Bitrate prottek attempt e notun kore count hoy.',
+                  style: const TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
             ]),
           ),
 
@@ -1748,6 +2165,15 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     );
   }
 
+  /// Subtitle line under the LIVE timer in the status card.
+  String get _liveStatusLine {
+    if (_engineScreen) {
+      final d = _resolvedScreenDest();
+      return 'Screen Live cholche • ${d?.name ?? ''} (1 destination)';
+    }
+    return '$_destCount destination e stream jacche';
+  }
+
   Widget _stat(String label, String value) {
     return Column(children: [
       Text(value, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, fontFeatures: [FontFeature.tabularFigures()])),
@@ -1800,6 +2226,8 @@ class GuidePage extends StatelessWidget {
           _p('Stream unexpected vabe theme gele sound + vibration shoho ekta joruri notification asbe — ek incident e ekbar e asbe, bar bar birokto korbe na. Reconnect sofol hole shanto vabe "Live abar chalu hoiche" notification asbe. Tai phone rekhe dure thakleo bujhte parba live er obostha ki.'),
           _h('⏹ Notification Controls'),
           _p('Live chola obosthay uporer notification ei ekta "Stop" button thakbe — app na khulei okhan theke live bondho kora jabe (manual stop, tai reconnect hobe na). Schedule ON thaka obosthay (live na cholle) notification e "Cancel" button thakbe — ota chaple schedule OFF hoye jabe. Notification er body te chap dile app khulbe.'),
+          _h('📱 Screen Live'),
+          _p('Phone er screen tai live stream:\n1) Live tab e Source theke "Screen Live" select koro\n2) Destinations theke ontoto 1 ta ON kore key dao, tarpor Screen Live panel theke destination beche nao\n3) Audio Mic (kotha bolte chaile) ba Mute select koro\n4) START LIVE chap dao — Android er "Start capturing?" popup asbe, Allow koro\n\n• Screen Live ek bare 1 ta destination ei jay — phone er screen capture encoder ekta RTMP stream ei pathay. Video (playlist) mode e kintu sob destination ek sathe jay, ager motoi\n• Prottek session e popup ta Allow korte hobe — eta Android er niyom, bypass kora jay na. Schedule diye Screen Live start korleo popup er jonno nije haate Allow korte hobe; keu na thakle start hobe na\n• Phone er vitore r audio (onno app/game er sound) direct capture hoy na. Mic select korle speaker er awaz mic diye kichuta jete pare\n• Quality Stream Settings theke ney: 480p/720p/1080p mane screen er chhoto diker size — boro dik screen er asol aspect onujayi scale hoy, kokhono asol screen er cheye boro hoy na\n• Live chalakalin status card e bitrate ar mot pathano data (Sent) dekhabe — RootEncoder library jeta dey setai; screen capture e FPS/Speed er real value library dey na bole "—" dekhay\n• Stream katle: capture session thakle popup charai auto-reconnect hoy (video mode er motoi backoff). Kintu notification ba system theke capture bondho kore dile session sesh — abar START LIVE diye notun permission lagbe\n• Notification er Stop button screen stream o bondho kore, video mode er motoi'),
           _h('Limit — shotti kotha'),
           _p('Eta phone-only system: phone off, battery sesh ba net chole gele LIVE o theme jabe. Phone na thakleo cholbe emon true 24/7 chaile alada server/VPS lage — seta onno setup.'),
         ],

@@ -46,4 +46,7 @@ flutter {
 
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+    // RootEncoder 2.8.1 (Apache-2.0) — native MediaProjection screen capture
+    // -> H.264/AAC -> RTMP for Screen Live (v1.4). Via JitPack.
+    implementation("com.github.pedroSG94.RootEncoder:library:2.8.1")
 }

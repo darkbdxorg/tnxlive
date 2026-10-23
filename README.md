@@ -6,7 +6,8 @@ simultaneously to YouTube, Facebook and any custom RTMP destination
 (including TikTok) straight from your Android phone.
 
 - Package: `com.tnxlive.app`
-- Stack: Flutter + FFmpegKit (GPL build with libx264) + foreground service
+- Stack: Flutter + FFmpegKit (GPL build with libx264) + RootEncoder
+  (screen capture) + foreground service
 - No account, no Firebase, no server. Stream keys are stored **only on your
   device** (SharedPreferences) and are never sent anywhere except the
   streaming platforms themselves.
@@ -33,6 +34,51 @@ simultaneously to YouTube, Facebook and any custom RTMP destination
 - **Live log + stats** — scrolling FFmpeg log (last ~100 lines), running
   duration timer, bitrate / FPS / speed / data-sent readouts.
 - **In-app guide** — where to find each platform's stream key (in Banglish).
+
+## New in v1.4
+
+- **Screen Live** — stream the phone's screen straight to RTMP. The Live
+  tab gains a **Source** selector: *Video (Playlist)* (existing behavior,
+  untouched) or *Screen*. Screen capture needs a native route (FFmpegKit
+  cannot capture the screen), so the encoder side uses
+  [RootEncoder](https://github.com/pedroSG94/RootEncoder) 2.8.1
+  (Apache-2.0, via JitPack): a Kotlin `ScreenStreamService` — the
+  mediaProjection-type foreground service Android 14 requires — hosts a
+  `GenericStream` with a `ScreenSource` (MediaProjection) and
+  MediaCodec H.264/AAC encoding, bridged to Dart over the
+  `tnxlive/screen` MethodChannel/EventChannel.
+  - **One destination at a time.** The native encoder publishes a single
+    RTMP stream (unlike video mode's FFmpeg `tee`), so the Screen panel
+    has a dropdown of the active profile's *enabled* destinations
+    (YouTube / Facebook / TikTok-Custom); the first enabled one is the
+    default. Video mode keeps full multi-destination streaming.
+  - **Consent popup every session.** Android shows its "Start capturing?"
+    dialog on every fresh start; the app launches it but cannot bypass
+    it. Denying it just logs and returns to OFFLINE. This also means a
+    *scheduled* Screen Live still needs a human tap on the popup.
+  - **Audio: Mic or Mute.** Mic uses `MicrophoneSource` (RECORD_AUDIO is
+    requested only when Mic is chosen). Internal/device audio capture is
+    **not** supported — Android restricts it to apps the media's own
+    developers opt in; on the roadmap it is out of scope by design.
+  - **Quality** reuses the 480p/720p/1080p setting: it caps the encoder's
+    short edge (480/720/1080, never above the real screen), the long edge
+    is scaled from the real screen size keeping aspect, and the bitrate
+    mapping matches video re-encode mode (~1200/2500/4500 kbps).
+  - **Stats are real or absent, never faked:** the status card shows
+    duration, current bitrate and total bytes sent — both reported by the
+    library (`ConnectChecker.onNewBitrate` + `getBytesSend()`). The
+    library exposes no FPS/speed for screen capture, so those readouts
+    show "—" in screen mode.
+  - **Same safety systems as video mode:** the stream-down alert fires on
+    an unexpected screen-stream drop; the notification **Stop** button
+    stops a screen stream through the same stop-intent path (no
+    reconnect, no alert); battery guard treats screen-live as live.
+  - **Screen reconnect, precisely:** the capture session (MediaProjection)
+    is kept alive across an RTMP drop, so auto-reconnect restarts the
+    stream on the same projection with the usual 10s→60s backoff and *no
+    new consent popup*. If the user stops the capture from the system UI,
+    the projection is dead: retries stop, the session ends with a log
+    entry, and the next Screen Live needs a fresh START + popup grant.
 
 ## New in v1.1
 
