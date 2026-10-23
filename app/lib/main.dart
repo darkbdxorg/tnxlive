@@ -17,6 +17,15 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 // ---------------------------------------------------------------------------
 // Foreground task (keeps the process alive with the screen off)
 // ---------------------------------------------------------------------------
+
+// Notification action buttons (v1.3, feature 11). While LIVE the persistent
+// notification carries a Stop button; while the schedule is armed (not live)
+// it carries a Cancel button. Presses are forwarded to the main isolate,
+// which owns the stream/schedule state.
+const _kBtnStopLive = 'btn_stop_live';
+const _kBtnCancelSchedule = 'btn_cancel_schedule';
+const _kNotifBtnPrefix = 'notif_button:';
+
 @pragma('vm:entry-point')
 void startCallback() {
   FlutterForegroundTask.setTaskHandler(LiveTaskHandler());
@@ -56,6 +65,7 @@ class LiveTaskHandler extends TaskHandler {
       FlutterForegroundTask.updateService(
         notificationTitle: 'TNxLive — Schedule ON',
         notificationText: 'Live shuru hobe $startLabel • bondho hobe $stopLabel',
+        notificationButtons: const [NotificationButton(id: _kBtnCancelSchedule, text: 'Cancel')],
       );
       return;
     }
@@ -65,7 +75,15 @@ class LiveTaskHandler extends TaskHandler {
     FlutterForegroundTask.updateService(
       notificationTitle: 'TNxLive — LIVE cholche',
       notificationText: 'Duration: ${_fmtDuration(elapsed)} • Screen off thakleo stream cholbe',
+      notificationButtons: const [NotificationButton(id: _kBtnStopLive, text: 'Stop')],
     );
+  }
+
+  @override
+  void onNotificationButtonPressed(String id) {
+    // The FFmpeg session and all stop/disarm logic live in the main isolate —
+    // forward the press there (v1.3, feature 11).
+    FlutterForegroundTask.sendDataToMain('$_kNotifBtnPrefix$id');
   }
 
   @override
@@ -142,6 +160,13 @@ class TNxLiveApp extends StatelessWidget {
 // ---------------------------------------------------------------------------
 // Home
 // ---------------------------------------------------------------------------
+
+/// Why the current FFmpeg session is ending (v1.3). The session-complete
+/// callback reads this to tell a deliberate stop (manual / notification
+/// button / scheduled window end) apart from an unexpected drop, which is
+/// what drives auto-reconnect and the stream-down alert.
+enum _StopIntent { none, manual, scheduled }
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
   @override
@@ -196,7 +221,19 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   DateTime? _schedSuppressedFor; // window-start the user manually stopped in
   DateTime? _schedFailWindow;
   int _schedFailCount = 0;
-  bool _sessionEndedWithError = false;
+
+  // ---- Auto-reconnect (v1.3 feature 1) + stream-down alert (feature 8) ----
+  bool _reconnectOn = true; // settings toggle, persisted as 'reconnect_on'
+  bool _liveIntent = false; // user/schedule wants to be live right now
+  _StopIntent _stopIntent = _StopIntent.none; // why the session is ending
+  bool _sessionActive = false; // an FFmpeg session is executing right now
+  int _sessionGen = 0; // bumped per launch; stale callbacks check it
+  bool _reconnecting = false; // sitting in the backoff countdown
+  int _reconnectAttempt = 0; // attempts since the last healthy stream
+  int _reconnectInSec = 0; // countdown shown in the status card
+  Timer? _reconnectTimer;
+  bool _downAlertFired = false; // loud alert already sent for this incident
+  bool _pendingOkNotify = false; // next stats tick = reconnect succeeded
 
   // ---- Battery guard (feature 9) ----
   final Battery _battery = Battery();
@@ -217,6 +254,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     super.initState();
     _pulse = AnimationController(vsync: this, duration: const Duration(milliseconds: 900))..repeat(reverse: true);
     _initForegroundTask();
+    FlutterForegroundTask.addTaskDataCallback(_onTaskData);
     _initNotifications();
     _loadPrefs();
     for (final c in [_ytKey, _fbKey, _customUrl]) {
@@ -230,6 +268,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     _ticker?.cancel();
     _schedTimer?.cancel();
     _batteryTimer?.cancel();
+    _reconnectTimer?.cancel();
+    FlutterForegroundTask.removeTaskDataCallback(_onTaskData);
     _pulse.dispose();
     _logScroll.dispose();
     super.dispose();
@@ -309,6 +349,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       _schedStop = _todFromMinutes(p.getInt('sched_stop_min') ?? 6 * 60);
       final th = p.getInt('battery_threshold') ?? 15;
       _batteryThreshold = (th == 10 || th == 20) ? th : 15;
+      _reconnectOn = p.getBool('reconnect_on') ?? true;
       _loading = false;
     });
 
@@ -336,6 +377,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     await p.setInt('sched_start_min', _schedStart.hour * 60 + _schedStart.minute);
     await p.setInt('sched_stop_min', _schedStop.hour * 60 + _schedStop.minute);
     await p.setInt('battery_threshold', _batteryThreshold);
+    await p.setBool('reconnect_on', _reconnectOn);
     // Any field edit auto-saves back into the active profile.
     if (_profiles.isNotEmpty) {
       _profiles[_activeProfile] = _snapshotProfile(_profiles[_activeProfile]['name'] as String? ?? 'Profile ${_activeProfile + 1}');
@@ -464,7 +506,26 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         description: 'Battery komle ar schedule er alert',
         importance: Importance.high,
       );
-      await _notif.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()?.createNotificationChannel(channel);
+      // v1.3 feature 8: dedicated max-importance channel for stream-down
+      // alerts (sound + vibration), plus a quiet channel for follow-ups.
+      const downChannel = AndroidNotificationChannel(
+        'tnxlive_stream_alerts',
+        'TNxLive Stream Alerts',
+        description: 'Live theme gele joruri alert (sound + vibration)',
+        importance: Importance.max,
+        playSound: true,
+        enableVibration: true,
+      );
+      const infoChannel = AndroidNotificationChannel(
+        'tnxlive_info',
+        'TNxLive Info',
+        description: 'Live abar chalu howar moto choto khobor',
+        importance: Importance.defaultImportance,
+      );
+      final androidNotif = _notif.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+      await androidNotif?.createNotificationChannel(channel);
+      await androidNotif?.createNotificationChannel(downChannel);
+      await androidNotif?.createNotificationChannel(infoChannel);
     } catch (_) {
       // alerts are best-effort; the in-app banner/log still work
     }
@@ -490,11 +551,59 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     } catch (_) {}
   }
 
+  // v1.3 feature 8: the LOUD stream-down alert — max importance, sound and
+  // vibration, on its own channel so it punches through like an alarm.
+  Future<void> _showDownAlert(String body) async {
+    try {
+      await _notif.show(
+        9003,
+        '⚠ Live theme geche!',
+        body,
+        const NotificationDetails(
+          android: AndroidNotificationDetails(
+            'tnxlive_stream_alerts',
+            'TNxLive Stream Alerts',
+            channelDescription: 'Live theme gele joruri alert (sound + vibration)',
+            importance: Importance.max,
+            priority: Priority.max,
+            playSound: true,
+            enableVibration: true,
+            icon: '@mipmap/ic_launcher',
+          ),
+        ),
+      );
+    } catch (_) {}
+  }
+
+  // v1.3 feature 8: quiet follow-up (e.g. "live abar chalu hoiche") — normal
+  // importance on the info channel, no insistent sound.
+  Future<void> _showInfoNotif(int id, String title, String body) async {
+    try {
+      await _notif.show(
+        id,
+        title,
+        body,
+        const NotificationDetails(
+          android: AndroidNotificationDetails(
+            'tnxlive_info',
+            'TNxLive Info',
+            channelDescription: 'Live abar chalu howar moto choto khobor',
+            importance: Importance.defaultImportance,
+            priority: Priority.defaultPriority,
+            icon: '@mipmap/ic_launcher',
+          ),
+        ),
+      );
+    } catch (_) {}
+  }
+
   // ---------- battery guard ----------
-  void _startBatteryWatch() {
+  void _startBatteryWatch({bool resetFired = true}) {
     _batteryTimer?.cancel();
-    _batteryFired = false;
-    if (mounted) setState(() => _batteryWarn = null);
+    if (resetFired) {
+      _batteryFired = false;
+      if (mounted) setState(() => _batteryWarn = null);
+    }
     _batteryTimer = Timer.periodic(const Duration(seconds: 30), (_) => _checkBattery());
     _checkBattery();
   }
@@ -573,6 +682,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         serviceTypes: [ForegroundServiceTypes.mediaPlayback],
         notificationTitle: 'TNxLive — Schedule ON',
         notificationText: 'Live shuru hobe ${_fmtTod(_schedStart)} • bondho hobe ${_fmtTod(_schedStop)}',
+        notificationButtons: const [NotificationButton(id: _kBtnCancelSchedule, text: 'Cancel')],
         callback: startCallback,
       );
       if (r is ServiceRequestFailure) _addLog('Foreground service warning: ${r.error}');
@@ -580,6 +690,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       FlutterForegroundTask.updateService(
         notificationTitle: 'TNxLive — Schedule ON',
         notificationText: 'Live shuru hobe ${_fmtTod(_schedStart)} • bondho hobe ${_fmtTod(_schedStop)}',
+        notificationButtons: const [NotificationButton(id: _kBtnCancelSchedule, text: 'Cancel')],
       );
     }
   }
@@ -656,13 +767,35 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     } else if (!inWin && _live && _liveBySchedule) {
       _schedBusy = true;
       _addLog('Schedule stop time hoyeche — live bondho hocche');
-      _liveBySchedule = false; // scheduled stop — manual-stop suppression must not apply
-      await _stopLive();
+      // Scheduled stop: clears this session's live intent (no reconnect) and
+      // must NOT trigger the manual-stop window suppression.
+      await _stopLive(fromSchedule: true);
       _schedBusy = false;
     }
   }
 
   // ---------- foreground task ----------
+  // v1.3 feature 11: notification action buttons. The task handler isolate
+  // forwards presses via FlutterForegroundTask.sendDataToMain; they land
+  // here, where the stream/schedule state actually lives, and run the exact
+  // same stop/disarm code paths as the in-app controls.
+  void _onTaskData(Object data) {
+    if (data is! String || !data.startsWith(_kNotifBtnPrefix)) return;
+    if (!mounted) return;
+    final id = data.substring(_kNotifBtnPrefix.length);
+    if (id == _kBtnStopLive) {
+      if (_live) {
+        _addLog('Notification er Stop button theke stream bondho kora holo');
+        _stopLive();
+      }
+    } else if (id == _kBtnCancelSchedule) {
+      if (_schedOn) {
+        _addLog('Notification er Cancel button theke schedule OFF kora holo');
+        _disarmSchedule();
+      }
+    }
+  }
+
   void _initForegroundTask() {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
@@ -763,17 +896,46 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     return f.path;
   }
 
+  /// Entry point for going live (START button + schedule). Sets the live
+  /// intent; the actual FFmpeg launch lives in [_launchStream] so
+  /// auto-reconnect can re-run it after a drop.
   Future<void> _startLive() async {
     final err = _validate();
     if (err != null) {
       _snack(err);
       return;
     }
+    _liveIntent = true;
+    _reconnectAttempt = 0;
+    _downAlertFired = false;
+    final ok = await _launchStream(isReconnect: false);
+    if (!ok) {
+      _liveIntent = false;
+      await _cleanupAfterStop();
+    }
+  }
+
+  /// Builds the FFmpeg command from the current fields and launches one
+  /// session. Returns false if the session could not even be launched.
+  /// A reconnect launch skips permissions/prefs (already done at the
+  /// original start) and keeps the original start time, so the displayed
+  /// duration covers the whole live session including reconnect gaps.
+  /// Sent/Bitrate/FPS/Speed come from the current FFmpeg session itself,
+  /// so those restart from zero on each attempt — the playlist also
+  /// restarts from the beginning on a reconnect (new FFmpeg session).
+  Future<bool> _launchStream({required bool isReconnect}) async {
+    _stopIntent = _StopIntent.none;
     setState(() => _starting = true);
-    await _ensurePermissions();
-    await _savePrefs();
+    if (!isReconnect) {
+      await _ensurePermissions();
+      await _savePrefs();
+    }
 
     final dests = _activeDestinations();
+    if (dests.isEmpty) {
+      if (mounted) setState(() => _starting = false);
+      return false;
+    }
     final listPath = await _buildConcatFile();
 
     // Build FFmpeg arguments
@@ -797,20 +959,28 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       args.addAll(['-f', 'tee', tee]);
     }
 
-    _addLog('Stream start hocche → ${dests.map((d) => d.name).join(', ')}');
-    _addLog('Mode: ${_mode == 'copy' ? 'Copy (no re-encode)' : 'Re-encode $_quality'} • ${_videos.length} video loop');
-    _sessionEndedWithError = false;
+    if (isReconnect) {
+      _addLog('Stream abar start hocche → ${dests.map((d) => d.name).join(', ')}');
+    } else {
+      _addLog('Stream start hocche → ${dests.map((d) => d.name).join(', ')}');
+      _addLog('Mode: ${_mode == 'copy' ? 'Copy (no re-encode)' : 'Re-encode $_quality'} • ${_videos.length} video loop');
+    }
 
-    // Foreground service (process keep-alive + notification)
+    // Foreground service (process keep-alive + notification). On a reconnect
+    // the service is already running and live_started_ms keeps the ORIGINAL
+    // session start, so the notification duration matches the in-app one.
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('fg_mode', 'live');
-    await prefs.setInt('live_started_ms', DateTime.now().millisecondsSinceEpoch);
+    if (!isReconnect) {
+      await prefs.setInt('live_started_ms', DateTime.now().millisecondsSinceEpoch);
+    }
     if (!await FlutterForegroundTask.isRunningService) {
       final r = await FlutterForegroundTask.startService(
         serviceId: 888,
         serviceTypes: [ForegroundServiceTypes.mediaPlayback],
         notificationTitle: 'TNxLive — LIVE cholche',
         notificationText: 'Stream cholche • ${dests.map((d) => d.name).join(', ')}',
+        notificationButtons: const [NotificationButton(id: _kBtnStopLive, text: 'Stop')],
         callback: startCallback,
       );
       if (r is ServiceRequestFailure) _addLog('Foreground service warning: ${r.error}');
@@ -819,66 +989,198 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       FlutterForegroundTask.updateService(
         notificationTitle: 'TNxLive — LIVE cholche',
         notificationText: 'Stream cholche • ${dests.map((d) => d.name).join(', ')}',
+        notificationButtons: const [NotificationButton(id: _kBtnStopLive, text: 'Stop')],
       );
     }
     await WakelockPlus.enable();
 
+    if (!_liveIntent) {
+      // A stop landed while we were preparing (e.g. during reconnect prep).
+      if (mounted) setState(() => _starting = false);
+      return false;
+    }
+
     FFmpegKitConfig.setLogLevel(21); // AV_LOG_INFO-ish; keep logs useful
-    final session = await FFmpegKit.executeWithArgumentsAsync(
-      args,
-      (session) async {
-        final rc = await session.getReturnCode();
-        if (!mounted) return;
-        if (ReturnCode.isCancel(rc)) {
-          _addLog('Stream bondho kora hoyeche');
-        } else if (ReturnCode.isSuccess(rc)) {
-          _addLog('Stream shesh hoyeche');
-        } else {
-          _sessionEndedWithError = true;
-          final fail = await session.getFailStackTrace();
-          _addLog('Stream error (code: $rc) ${fail ?? ''}');
-          _snack('Stream theme geche — log dekho, key/net check koro');
-        }
-        await _cleanupAfterStop();
-      },
-      (log) => _addLog(log.getMessage()),
-      (stats) {
-        if (!mounted) return;
-        setState(() {
-          final br = stats.getBitrate();
-          _statBitrate = br <= 0 ? '—' : (br >= 1000 ? '${(br / 1000).toStringAsFixed(2)} Mbps' : '${br.toStringAsFixed(0)} kbps');
-          _statFps = stats.getVideoFps() <= 0 ? '—' : stats.getVideoFps().toStringAsFixed(0);
-          _statSpeed = stats.getSpeed() <= 0 ? '—' : '${stats.getSpeed().toStringAsFixed(2)}x';
-          final sz = stats.getSize();
-          _statSize = sz <= 0 ? '—' : '${(sz / (1024 * 1024)).toStringAsFixed(1)} MB';
-        });
-      },
-    );
-    _sessionId = session.getSessionId();
+    final gen = ++_sessionGen;
+    try {
+      final session = await FFmpegKit.executeWithArgumentsAsync(
+        args,
+        (session) async {
+          // Ignore callbacks from an older, already-replaced session.
+          if (gen != _sessionGen) return;
+          _sessionActive = false;
+          final rc = await session.getReturnCode();
+          if (!mounted) return;
+          final intent = _stopIntent;
+          _stopIntent = _StopIntent.none;
+          if (intent != _StopIntent.none || ReturnCode.isCancel(rc)) {
+            // Deliberate stop (in-app button, notification Stop button or
+            // schedule window end) — never reconnect, never alert.
+            _addLog('Stream bondho kora hoyeche');
+            _liveIntent = false;
+            await _cleanupAfterStop();
+            return;
+          }
+          // The session ended while we still wanted to be live: a drop.
+          if (ReturnCode.isSuccess(rc)) {
+            _addLog('Stream hotath shesh hoye geche (loop to shesh howar kotha na)');
+          } else {
+            final fail = await session.getFailStackTrace();
+            _addLog('Stream error (code: $rc) ${fail ?? ''}');
+            _snack('Stream theme geche — log dekho, key/net check koro');
+          }
+          await _handleUnexpectedDrop();
+        },
+        (log) {
+          if (gen == _sessionGen) _addLog(log.getMessage());
+        },
+        (stats) {
+          if (gen != _sessionGen || !mounted) return;
+          if (_pendingOkNotify) {
+            // First real data of a reconnected session: incident over.
+            _pendingOkNotify = false;
+            _reconnectAttempt = 0;
+            _downAlertFired = false;
+            if (_liveBySchedule) _schedFailCount = 0;
+            _addLog('✔ Reconnect hoyeche — live abar cholche');
+            _showInfoNotif(9004, 'TNxLive — Live abar chalu hoiche', 'Stream nije nije abar connect hoye geche — live cholche.');
+          }
+          setState(() {
+            final br = stats.getBitrate();
+            _statBitrate = br <= 0 ? '—' : (br >= 1000 ? '${(br / 1000).toStringAsFixed(2)} Mbps' : '${br.toStringAsFixed(0)} kbps');
+            _statFps = stats.getVideoFps() <= 0 ? '—' : stats.getVideoFps().toStringAsFixed(0);
+            _statSpeed = stats.getSpeed() <= 0 ? '—' : '${stats.getSpeed().toStringAsFixed(2)}x';
+            final sz = stats.getSize();
+            _statSize = sz <= 0 ? '—' : '${(sz / (1024 * 1024)).toStringAsFixed(1)} MB';
+          });
+        },
+      );
+      _sessionId = session.getSessionId();
+      _sessionActive = true;
+    } catch (e) {
+      _addLog('Stream start korte somossa holo: $e');
+      if (mounted) setState(() => _starting = false);
+      return false;
+    }
+    if (isReconnect) _pendingOkNotify = true;
 
     setState(() {
       _live = true;
       _starting = false;
-      _startedAt = DateTime.now();
+      _startedAt ??= DateTime.now();
     });
-    if (_liveBySchedule) {
+    if (_liveBySchedule && !isReconnect) {
       _schedFailCount = 0; // a successful scheduled start clears past failures
     }
-    _startBatteryWatch();
+    _startBatteryWatch(resetFired: !isReconnect);
     _ticker?.cancel();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
     });
+    return true;
   }
 
+  // ---- v1.3 features 1 + 8: unexpected drop → alert → reconnect/give up ----
+  Future<void> _handleUnexpectedDrop() async {
+    if (!_liveIntent) {
+      await _cleanupAfterStop();
+      return;
+    }
+    // Schedule failure accounting — extends the v1.1 rule: the initial drop
+    // and every failed reconnect inside the window each count once; at 3
+    // consecutive failures the schedule gives up and disarms instead of
+    // retry-looping for the rest of the window.
+    final wasSchedule = _liveBySchedule;
+    if (wasSchedule) {
+      _schedFailCount++;
+      _addLog('Schedule window e consecutive failure: $_schedFailCount/3');
+    }
+    final giveUp = wasSchedule && _schedFailCount >= 3;
+
+    // Feature 8: ONE loud alert per drop incident. A successful reconnect
+    // resets _downAlertFired (see the stats callback), so a genuinely new
+    // drop alerts again — but retries within one incident never re-alert.
+    if (!_downAlertFired) {
+      _downAlertFired = true;
+      final body = giveUp
+          ? 'Stream por por fail koreche — schedule OFF kore dewa hoyeche. Stream key/net check kore abar try koro.'
+          : _reconnectOn
+              ? 'Stream theme geche — auto-reconnect try kora hocche; live abar chalu hole janano hobe.'
+              : 'Stream theme geche ar bondho hoye geche — auto-reconnect OFF chilo. Key/net check koro.';
+      _addLog('⚠ Stream down alert pathano holo');
+      await _showDownAlert(body);
+    }
+
+    if (giveUp) {
+      _addLog('Schedule: ei window e stream 3 bar fail koreche — ar try kora hobe na');
+      _liveIntent = false;
+      await _cleanupAfterStop();
+      await _showAlert(9002, 'TNxLive — Schedule OFF', 'Stream bar bar fail koray schedule bondho kore dewa hoyeche. Key/net check kore abar ON koro.');
+      await _disarmSchedule();
+      return;
+    }
+    if (!_reconnectOn) {
+      _liveIntent = false;
+      await _cleanupAfterStop();
+      return;
+    }
+    _planReconnect();
+  }
+
+  void _planReconnect() {
+    _reconnectAttempt++;
+    var delay = 10 << (_reconnectAttempt - 1); // 10s, 20s, 40s, then capped
+    if (delay > 60) delay = 60;
+    _addLog('Auto-reconnect: ${delay}s por abar try hobe (attempt $_reconnectAttempt)');
+    if (mounted) {
+      setState(() {
+        _reconnecting = true;
+        _reconnectInSec = delay;
+      });
+    }
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted || !_liveIntent) {
+        // Manual/scheduled stop cancels the pending retry for good.
+        t.cancel();
+        return;
+      }
+      if (_reconnectInSec <= 1) {
+        t.cancel();
+        if (mounted) setState(() => _reconnectInSec = 0);
+        _launchReconnect();
+      } else {
+        setState(() => _reconnectInSec--);
+      }
+    });
+  }
+
+  Future<void> _launchReconnect() async {
+    if (!_liveIntent || !mounted) return;
+    setState(() => _reconnecting = false);
+    _addLog('Reconnect try kora hocche (attempt $_reconnectAttempt)…');
+    final ok = await _launchStream(isReconnect: true);
+    if (!ok) {
+      // Couldn't even launch — counts as another failed attempt and loops
+      // back through the same backoff + schedule accounting (no extra loud
+      // alert: _downAlertFired is already true for this incident).
+      await _handleUnexpectedDrop();
+    }
+  }
+
+  /// Final teardown for a live session whose intent has ended (deliberate
+  /// stop, auto-reconnect OFF, or schedule give-up). NOT called for a drop
+  /// that will reconnect — service, wakelock and timers stay up across the
+  /// backoff gap. Schedule failure counting no longer happens here; it moved
+  /// to _handleUnexpectedDrop (v1.3) so failed reconnect attempts count too.
   Future<void> _cleanupAfterStop() async {
+    _reconnectTimer?.cancel();
     _ticker?.cancel();
     _batteryTimer?.cancel();
-    // Count schedule-started streams that died with an error, so the
-    // scheduler can give up after 3 failures in the same window.
-    if (_liveBySchedule && _sessionEndedWithError) {
-      _schedFailCount++;
-    }
+    _sessionActive = false;
+    _liveIntent = false;
+    _reconnecting = false;
+    _pendingOkNotify = false;
     _liveBySchedule = false;
     await WakelockPlus.disable();
     if (await FlutterForegroundTask.isRunningService) {
@@ -900,22 +1202,36 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     }
   }
 
-  Future<void> _stopLive() async {
+  /// Deliberate stop. The in-app STOP button and the notification Stop
+  /// button call this with fromSchedule: false; the schedule window-end
+  /// calls it with fromSchedule: true. Either way the live intent is
+  /// cleared first, so a deliberate stop NEVER triggers auto-reconnect or
+  /// the stream-down alert.
+  Future<void> _stopLive({bool fromSchedule = false}) async {
+    _stopIntent = fromSchedule ? _StopIntent.scheduled : _StopIntent.manual;
+    _liveIntent = false;
+    _reconnectTimer?.cancel();
     // If the user manually stops a schedule-started stream, don't let the
-    // scheduler restart it in the same window.
-    if (_liveBySchedule) {
+    // scheduler restart it in the same window. A scheduled stop must not
+    // suppress — the window is over anyway.
+    if (!fromSchedule && _liveBySchedule) {
       _schedSuppressedFor = _windowStartOccurrence(DateTime.now());
       _addLog('Schedule-er live manually bondho kora holo — ei window e ar auto start hobe na');
     }
     _addLog('Stream bondho kora hocche…');
-    final id = _sessionId;
-    if (id != null) {
-      await FFmpegKit.cancel(id);
+    if (_sessionActive) {
+      final id = _sessionId;
+      if (id != null) {
+        await FFmpegKit.cancel(id);
+      } else {
+        await FFmpegKit.cancel();
+      }
+      // complete callback also cleans up; do it here too in case it lags
+      await _cleanupAfterStop();
     } else {
-      await FFmpegKit.cancel();
+      // No session running (reconnect countdown / starting) — clean up here.
+      await _cleanupAfterStop();
     }
-    // complete callback also cleans up; do it here too in case it lags
-    await _cleanupAfterStop();
   }
 
   void _snack(String msg) {
@@ -1009,7 +1325,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 child: SizedBox(
                   height: 58,
                   child: FilledButton.icon(
-                    onPressed: _starting ? null : (_live ? _stopLive : _startLive),
+                    onPressed: _starting ? null : (_live ? () => _stopLive() : _startLive),
                     icon: Icon(_live ? Icons.stop_circle_rounded : Icons.sensors_rounded, size: 24),
                     label: Text(_starting ? 'START HOCCHE…' : _live ? 'STOP LIVE' : 'START LIVE',
                         style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w900, letterSpacing: 1.2)),
@@ -1075,13 +1391,18 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                   ),
                 ),
                 const SizedBox(width: 10),
-                Text(_live ? 'LIVE' : 'OFFLINE',
+                Text(_reconnecting ? 'RECONNECTING' : _live ? 'LIVE' : 'OFFLINE',
                     style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, letterSpacing: 2, color: _live ? _red : _txtDim)),
               ]),
               const SizedBox(height: 6),
               Text(_live ? _fmtDuration(elapsed) : '00:00:00',
                   style: const TextStyle(fontSize: 34, fontWeight: FontWeight.w800, fontFeatures: [FontFeature.tabularFigures()])),
-              Text(_live ? '$_destCount destination e stream jacche' : 'Start korte niche sob set kore LIVE chap dao',
+              Text(
+                  _reconnecting
+                      ? 'Reconnecting in ${_reconnectInSec}s (attempt $_reconnectAttempt)'
+                      : _live
+                          ? '$_destCount destination e stream jacche'
+                          : 'Start korte niche sob set kore LIVE chap dao',
                   style: const TextStyle(color: _txtDim, fontSize: 12.5)),
               const SizedBox(height: 14),
               Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
@@ -1224,6 +1545,28 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               ]),
               const SizedBox(height: 6),
               const Text('Copy mode e re-encode hoy na bole CPU/battery kom lage, kintu video age thekei H.264 + AAC format e thakte hobe, na hole stream cholbe na.',
+                  style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
+              const SizedBox(height: 16),
+              Row(children: [
+                const Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text('Auto-reconnect', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                    SizedBox(height: 2),
+                    Text('Stream hotath katle nije nije abar connect korbe — 10s, 20s, 40s, tarpor sorboccho 60s por por try cholbe. Manual STOP dile reconnect hobe na.',
+                        style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
+                  ]),
+                ),
+                Switch(
+                  value: _reconnectOn,
+                  onChanged: (v) {
+                    setState(() => _reconnectOn = v);
+                    _savePrefs();
+                    _addLog(v ? 'Auto-reconnect ON kora holo' : 'Auto-reconnect OFF kora holo');
+                  },
+                ),
+              ]),
+              const SizedBox(height: 6),
+              const Text('Note: reconnect hole playlist prothom theke abar start hoy (notun FFmpeg session). Live duration prothom start thekei count hoy, kintu Sent/Bitrate prottek attempt e notun kore count hoy.',
                   style: TextStyle(color: _txtDim, fontSize: 11.5, height: 1.35)),
             ]),
           ),
@@ -1451,6 +1794,12 @@ class GuidePage extends StatelessWidget {
           _p('Protidin nirdishto time e auto live start/stop:\n1) Age playlist, key ar settings thik kore nao\n2) Schedule card e start ar stop time set koro\n3) Toggle ON koro — bas, protidin oi time e live start hobe\n\nWindow er vitore thaka obosthay ON korle sathe sathe live start hobe. Rat 10 ta → sokal 6 tar moto ulta (overnight) time o cholbe.\n\n⚠ Schedule kaj korte hole app ta force-stop kora jabe na ar notification ta rekhe dite hobe — system app mere dile schedule o theme jabe. Phone restart er por ekbar app khullei schedule abar active hoy.'),
           _h('🔋 Battery Guard'),
           _p('Live chalakalin battery set kora level (10/15/20%) er niche neme gele ekta notification + screen e warning asbe. Charge lagiye level abar threshold er upore uthle guard nije nije abar active hoy — tai ekbar warning dekhle charger lagiye dilei hobe.'),
+          _h('🔁 Auto-reconnect'),
+          _p('Net ba server er karone stream hotath theme gele TNxLive nije nije abar connect kore (Stream Settings e "Auto-reconnect" ON thakle, by default ON). Prothom try 10 second por, tarpor 20s, 40s, erpor sorboccho 60 second por por try cholte thakbe. Status card e "RECONNECTING" countdown dekhte paba.\n\n• Manual STOP dile (app theke ba notification er Stop button) reconnect hobe na — seta ichha kore bondho kora\n• Schedule er live majhkhane katle window er vitorei reconnect hobe, kintu por por 3 bar fail korle schedule nijei OFF hoye jabe\n• Reconnect hole playlist prothom theke abar start hoy — majhkhan theke na'),
+          _h('🔔 Stream Down Alert'),
+          _p('Stream unexpected vabe theme gele sound + vibration shoho ekta joruri notification asbe — ek incident e ekbar e asbe, bar bar birokto korbe na. Reconnect sofol hole shanto vabe "Live abar chalu hoiche" notification asbe. Tai phone rekhe dure thakleo bujhte parba live er obostha ki.'),
+          _h('⏹ Notification Controls'),
+          _p('Live chola obosthay uporer notification ei ekta "Stop" button thakbe — app na khulei okhan theke live bondho kora jabe (manual stop, tai reconnect hobe na). Schedule ON thaka obosthay (live na cholle) notification e "Cancel" button thakbe — ota chaple schedule OFF hoye jabe. Notification er body te chap dile app khulbe.'),
           _h('Limit — shotti kotha'),
           _p('Eta phone-only system: phone off, battery sesh ba net chole gele LIVE o theme jabe. Phone na thakleo cholbe emon true 24/7 chaile alada server/VPS lage — seta onno setup.'),
         ],

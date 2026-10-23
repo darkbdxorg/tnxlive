@@ -63,6 +63,41 @@ simultaneously to YouTube, Facebook and any custom RTMP destination
   threshold + 5, or on the next live session. Starting a live session
   already below the threshold warns immediately.
 
+## New in v1.3
+
+- **Auto-reconnect** — a "live intent" model: while the app is supposed to
+  be live, an FFmpeg session that ends or fails *unexpectedly* (network
+  drop, encoder error) is restarted automatically with exponential backoff —
+  10s, 20s, 40s, then capped at 60s between attempts. The status card shows
+  "RECONNECTING — Reconnecting in Xs (attempt N)" and the Live Log records
+  the drop, the countdown and the outcome. A deliberate stop (in-app STOP,
+  the notification Stop button, or the schedule window end) clears the
+  intent and never reconnects. A schedule-started stream that drops
+  mid-window reconnects like any other, still stops at the window end, and
+  its failed attempts count toward the v1.1 rule: 3 consecutive failures in
+  one window disarm the schedule with an alert. Toggle it in *Stream
+  Settings → Auto-reconnect* (default ON; persisted). **Note:** a reconnect
+  starts a brand-new FFmpeg session, so **the playlist restarts from the
+  beginning**. The on-screen duration keeps counting from the original
+  session start (including reconnect gaps), while Sent / Bitrate / FPS /
+  Speed are per-attempt and restart from zero, because they are read from
+  the current FFmpeg session.
+- **Stream-down alert** — an unexpected drop fires **one** loud notification
+  per incident on a dedicated max-importance channel (`⚠ Live theme geche!`,
+  sound + vibration): the body says auto-reconnect is trying, or that the
+  stream has stopped (reconnect OFF), or that the schedule gave up. When a
+  reconnect succeeds, a quiet follow-up (`Live abar chalu hoiche`, normal
+  importance) fires once. Every alert is also written to the Live Log.
+- **Notification controls** — the persistent foreground-service notification
+  now carries action buttons: **Stop** while LIVE (stops exactly like the
+  in-app STOP — clears intent, no reconnect) and **Cancel** while the
+  schedule is armed but not live (disarms the schedule). Tapping the
+  notification body still opens the app. Implemented with
+  flutter_foreground_task `NotificationButton`s; the task handler forwards
+  presses to the main isolate (`sendDataToMain` → `addTaskDataCallback`),
+  which runs the normal stop/disarm code paths. The battery-guard
+  notifications are unchanged.
+
 ## New in v1.2
 
 - **Bottom navigation** — the old single long scrolling screen is split into
